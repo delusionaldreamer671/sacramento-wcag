@@ -1,0 +1,321 @@
+{
+  "timestamp": "2026-02-24T02:39:44.622918+00:00",
+  "corpus_path": "C:\\Users\\sahaj\\OneDrive\\Documents\\Business\\US County PDF Remediation POC\\Test Files",
+  "results": [
+    {
+      "filename": "2019 SCTDF TIF -Nexus Study With App A-H.pdf",
+      "status": "ok",
+      "elapsed_s": 307.125,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\2019 SCTDF TIF -Nexus Study With App A-H.html",
+      "score": 0.9,
+      "classification": "GREEN",
+      "gaps": [
+        {
+          "criterion": "HEADING_HIERARCHY",
+          "severity": "moderate",
+          "description": "Heading levels skip 1 time(s). Skipping heading levels breaks document outline structure (WCAG 2.4.6).",
+          "classification": "YELLOW",
+          "details": {
+            "skipped_levels": [
+              {
+                "from": "h2",
+                "to": "h4",
+                "heading_text": "Intersection Improvements"
+              }
+            ]
+          }
+        }
+      ],
+      "error": null
+    },
+    {
+      "filename": "BLApp.pdf",
+      "status": "ok",
+      "elapsed_s": 13.149,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\BLApp.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "BOARD_OF_SUPERVISORS_10211_Agenda_2_10_2026_9_30_00_AM.pdf",
+      "status": "ok",
+      "elapsed_s": 10.482,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\BOARD_OF_SUPERVISORS_10211_Agenda_2_10_2026_9_30_00_AM.html",
+      "score": 0.9,
+      "classification": "GREEN",
+      "gaps": [
+        {
+          "criterion": "TABLE_EXISTS",
+          "severity": "critical",
+          "description": "Document text contains table-like patterns (9 hint(s): ['$2', '$5', '$7', '$8', 'charge', 'fee', 'schedule']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+          "classification": "RED",
+          "details": {
+            "table_count": 0,
+            "hint_count": 9,
+            "hint_samples": [
+              "$5",
+              "fee",
+              "schedule",
+              "$7",
+              "$8"
+            ]
+          }
+        }
+      ],
+      "error": null
+    },
+    {
+      "filename": "Final LRSP_04-6-2022_Updated.pdf",
+      "status": "ok",
+      "elapsed_s": 50.708,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\Final LRSP_04-6-2022_Updated.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "FY 24-25 Five-Year Report And TIF Five-Year Report For Fiscal Years 2020-2025 2020-21 \u2013 2024-25.pdf",
+      "status": "ok",
+      "elapsed_s": 11.041,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\FY 24-25 Five-Year Report And TIF Five-Year Report For Fiscal Years 2020-2025 2020-21 \u2013 2024-25.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "General Plan Update 2030 FEIR Vol III.pdf",
+      "status": "ok",
+      "elapsed_s": 9.609,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\General Plan Update 2030 FEIR Vol III.html",
+      "score": 0.8,
+      "classification": "YELLOW",
+      "gaps": [
+        {
+          "criterion": "TABLE_EXISTS",
+          "severity": "critical",
+          "description": "Document text contains table-like patterns (25 hint(s): ['assessment', 'charge', 'fee', 'rate', 'schedule']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+          "classification": "RED",
+          "details": {
+            "table_count": 0,
+            "hint_count": 25,
+            "hint_samples": [
+              "assessment",
+              "rate",
+              "fee",
+              "charge",
+              "schedule"
+            ]
+          }
+        },
+        {
+          "criterion": "SEMANTIC_STRUCTURE",
+          "severity": "moderate",
+          "description": "Document is missing structural landmarks: no headings or tables found \u2014 document has no navigable structure.",
+          "classification": "YELLOW",
+          "details": {
+            "has_main": true,
+            "has_heading": false,
+            "has_table": false,
+            "issues": [
+              "no headings or tables found \u2014 document has no navigable structure"
+            ]
+          }
+        }
+      ],
+      "error": null
+    },
+    {
+      "filename": "non-cutting_Consulting_Arborist_Sacramento_Area.pdf",
+      "status": "ok",
+      "elapsed_s": 8.129,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\non-cutting_Consulting_Arborist_Sacramento_Area.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "SacCounty_FireDistricts.pdf",
+      "status": "ok",
+      "elapsed_s": 8.365,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\SacCounty_FireDistricts.html",
+      "score": 0.9,
+      "classification": "GREEN",
+      "gaps": [
+        {
+          "criterion": "SEMANTIC_STRUCTURE",
+          "severity": "moderate",
+          "description": "Document is missing structural landmarks: no headings or tables found \u2014 document has no navigable structure.",
+          "classification": "YELLOW",
+          "details": {
+            "has_main": true,
+            "has_heading": false,
+            "has_table": false,
+            "issues": [
+              "no headings or tables found \u2014 document has no navigable structure"
+            ]
+          }
+        }
+      ],
+      "error": null
+    },
+    {
+      "filename": "SB205_Fillable_Form.pdf",
+      "status": "ok",
+      "elapsed_s": 10.703,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\SB205_Fillable_Form.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "SCTDF Fee District Map.pdf",
+      "status": "ok",
+      "elapsed_s": 11.184,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\SCTDF Fee District Map.html",
+      "score": 0.8,
+      "classification": "YELLOW",
+      "gaps": [
+        {
+          "criterion": "TABLE_EXISTS",
+          "severity": "critical",
+          "description": "Document text contains table-like patterns (1 hint(s): ['fee']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+          "classification": "RED",
+          "details": {
+            "table_count": 0,
+            "hint_count": 1,
+            "hint_samples": [
+              "fee"
+            ]
+          }
+        },
+        {
+          "criterion": "SEMANTIC_STRUCTURE",
+          "severity": "moderate",
+          "description": "Document is missing structural landmarks: no headings or tables found \u2014 document has no navigable structure.",
+          "classification": "YELLOW",
+          "details": {
+            "has_main": true,
+            "has_heading": false,
+            "has_table": false,
+            "issues": [
+              "no headings or tables found \u2014 document has no navigable structure"
+            ]
+          }
+        }
+      ],
+      "error": null
+    },
+    {
+      "filename": "SCTDF TIF Fees Tables -Acella Effective 3-31-25.pdf",
+      "status": "ok",
+      "elapsed_s": 17.404,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\SCTDF TIF Fees Tables -Acella Effective 3-31-25.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    },
+    {
+      "filename": "Tree_Permit_Application.pdf",
+      "status": "ok",
+      "elapsed_s": 10.668,
+      "html_path": "C:\\Users\\sahaj\\sacramento-wcag\\test-results\\Tree_Permit_Application.html",
+      "score": 1.0,
+      "classification": "GREEN",
+      "gaps": [],
+      "error": null
+    }
+  ],
+  "stats": {
+    "total_pdfs": 12,
+    "conversion_ok": 12,
+    "conversion_errors": 0,
+    "validation_errors": 0,
+    "pass_rate": 1.0,
+    "green_rate": 0.8333,
+    "avg_accessibility_score": 0.9417,
+    "avg_elapsed_s": 39.047,
+    "total_elapsed_s": 468.567,
+    "validator_available": true
+  },
+  "gap_summary": {
+    "classification_counts": {
+      "GREEN": 10,
+      "YELLOW": 2,
+      "RED": 0,
+      "UNKNOWN": 0
+    },
+    "top_gap_types": [
+      {
+        "criterion": "TABLE_EXISTS",
+        "count": 3
+      },
+      {
+        "criterion": "SEMANTIC_STRUCTURE",
+        "count": 3
+      },
+      {
+        "criterion": "HEADING_HIERARCHY",
+        "count": 1
+      }
+    ],
+    "red_items_requiring_attention": [
+      {
+        "file": "BOARD_OF_SUPERVISORS_10211_Agenda_2_10_2026_9_30_00_AM.pdf",
+        "criterion": "TABLE_EXISTS",
+        "severity": "critical",
+        "description": "Document text contains table-like patterns (9 hint(s): ['$2', '$5', '$7', '$8', 'charge', 'fee', 'schedule']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+        "classification": "RED",
+        "details": {
+          "table_count": 0,
+          "hint_count": 9,
+          "hint_samples": [
+            "$5",
+            "fee",
+            "schedule",
+            "$7",
+            "$8"
+          ]
+        }
+      },
+      {
+        "file": "General Plan Update 2030 FEIR Vol III.pdf",
+        "criterion": "TABLE_EXISTS",
+        "severity": "critical",
+        "description": "Document text contains table-like patterns (25 hint(s): ['assessment', 'charge', 'fee', 'rate', 'schedule']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+        "classification": "RED",
+        "details": {
+          "table_count": 0,
+          "hint_count": 25,
+          "hint_samples": [
+            "assessment",
+            "rate",
+            "fee",
+            "charge",
+            "schedule"
+          ]
+        }
+      },
+      {
+        "file": "SCTDF Fee District Map.pdf",
+        "criterion": "TABLE_EXISTS",
+        "severity": "critical",
+        "description": "Document text contains table-like patterns (1 hint(s): ['fee']) but no <table> elements were found \u2014 content may have been flattened to <p> tags.",
+        "classification": "RED",
+        "details": {
+          "table_count": 0,
+          "hint_count": 1,
+          "hint_samples": [
+            "fee"
+          ]
+        }
+      }
+    ]
+  }
+}

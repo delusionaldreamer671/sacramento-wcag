@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Background / Foreground */
+    --background: 210 20% 98%;
+    --foreground: 212 50% 16%;
+
+    /* Card */
+    --card: 0 0% 100%;
+    --card-foreground: 212 50% 16%;
+
+    /* Popover */
+    --popover: 0 0% 100%;
+    --popover-foreground: 212 50% 16%;
+
+    /* Primary — Sacramento County navy #153554 */
+    --primary: 209 60% 21%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Secondary — Light blue tint #e1ecf7 */
+    --secondary: 213 55% 93%;
+    --secondary-foreground: 212 50% 16%;
+
+    /* Muted — Soft gray-blue */
+    --muted: 214 32% 95%;
+    --muted-foreground: 215 16% 47%;
+
+    /* Accent — Sacramento gold #C5972C */
+    --accent: 40 65% 47%;
+    --accent-foreground: 0 0% 100%;
+
+    /* Destructive */
+    --destructive: 0 84% 40%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Success */
+    --success: 142 71% 30%;
+    --success-foreground: 0 0% 100%;
+
+    /* Border / Input / Ring */
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 209 60% 21%;
+
+    /* Border radius */
+    --radius: 0.5rem;
+
+    /* Sacramento highlight blue #7bb0da */
+    --highlight: 208 55% 67%;
+
+    /* Status colors — WCAG AA contrast guaranteed */
+    --status-queued: 220 13% 55%;
+    --status-extracting: 208 55% 35%;
+    --status-ai-drafting: 262 52% 47%;
+    --status-hitl-review: 40 65% 38%;
+    --status-approved: 142 71% 30%;
+    --status-recompiling: 208 55% 35%;
+    --status-complete: 142 71% 30%;
+    --status-failed: 0 72% 41%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Ensure visible focus rings on all interactive elements — WCAG 2.4.7 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Remove default focus outline only when :focus-visible is supported */
+  :focus:not(:focus-visible) {
+    @apply outline-none;
+  }
+}
+
+@layer components {
+  /* Skip-to-content link — visible only when focused, required for keyboard users */
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50;
+    @apply focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-primary-foreground;
+    @apply focus:text-sm focus:font-medium focus:shadow-lg;
+  }
+
+  /* Status badge base */
+  .status-badge {
+    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold;
+  }
+
+  /* Keyboard shortcut pill */
+  .kbd {
+    @apply inline-flex items-center justify-center rounded border border-border bg-muted px-1.5 py-0.5;
+    @apply text-xs font-mono text-muted-foreground;
+  }
+
+  /* Review panel two-column layout */
+  .review-grid {
+    @apply grid grid-cols-1 gap-4 lg:grid-cols-2;
+  }
+
+  /* Sacramento County branded card */
+  .sac-card {
+    @apply rounded-lg border border-border bg-card p-5 shadow-sm transition-shadow hover:shadow-md;
+  }
+
+  /* Gold accent bar */
+  .gold-accent {
+    border-left: 4px solid hsl(var(--accent));
+  }
+}

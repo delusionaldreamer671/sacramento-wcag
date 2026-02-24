@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RulesLedger",
+  "description": "Versioned rules that are deterministically applied during remediation.",
+  "type": "object",
+  "required": ["version", "rules"],
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "trigger_pattern", "action", "confidence", "status"],
+        "properties": {
+          "rule_id": { "type": "string" },
+          "trigger_pattern": { "type": "string", "description": "Pattern like 'table:missing_headers' or 'image:no_alt'" },
+          "action": {
+            "type": "object",
+            "description": "What the rule does when triggered",
+            "additionalProperties": true
+          },
+          "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "created_from": { "type": ["string", "null"], "description": "Change proposal ID that spawned this rule" },
+          "validated_on_docs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Document IDs where this rule was validated"
+          },
+          "rollback_supported": { "type": "boolean", "default": true },
+          "version": { "type": "integer", "minimum": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["candidate", "active", "suspended", "deprecated"]
+          },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

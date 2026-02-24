@@ -1,0 +1,50 @@
+# Environment variables (secrets)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
+# Node
+hitl-dashboard/node_modules/
+hitl-dashboard/.next/
+hitl-dashboard/out/
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Audit logs (local only)
+.claude/audit/
+.claude/metrics.jsonl
+
+# Adobe Extract API cache (local only — avoids burning free-tier quota)
+.extract_cache/

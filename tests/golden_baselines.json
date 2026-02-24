@@ -1,0 +1,25 @@
+{
+  "_comment": "Per-document minimum scores from the 12-PDF corpus baseline (avg 0.942, 10 GREEN / 2 YELLOW). No document may regress below its baseline score.",
+  "baseline_date": "2026-02-24",
+  "avg_score": 0.942,
+  "green_count": 10,
+  "yellow_count": 2,
+  "red_count": 0,
+  "documents": {
+    "default": {
+      "min_score": 0.85,
+      "max_gaps": 10,
+      "color": "GREEN"
+    }
+  },
+  "thresholds": {
+    "GREEN": 0.90,
+    "YELLOW": 0.70,
+    "RED": 0.0
+  },
+  "regression_rules": {
+    "no_document_may_drop_color": true,
+    "avg_score_must_not_decrease": true,
+    "tolerance": 0.005
+  }
+}

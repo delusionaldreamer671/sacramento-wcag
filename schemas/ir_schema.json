@@ -1,0 +1,213 @@
+{
+  "$defs": {
+    "BlockSource": {
+      "enum": [
+        "adobe",
+        "ocr",
+        "manual_override",
+        "pypdf_fallback"
+      ],
+      "title": "BlockSource",
+      "type": "string"
+    },
+    "BlockType": {
+      "enum": [
+        "heading",
+        "paragraph",
+        "table",
+        "image",
+        "list",
+        "form_field"
+      ],
+      "title": "BlockType",
+      "type": "string"
+    },
+    "BoundingBox": {
+      "description": "Coordinate box for an element on a page (in PDF points).",
+      "properties": {
+        "x1": {
+          "default": 0.0,
+          "title": "X1",
+          "type": "number"
+        },
+        "y1": {
+          "default": 0.0,
+          "title": "Y1",
+          "type": "number"
+        },
+        "x2": {
+          "default": 0.0,
+          "title": "X2",
+          "type": "number"
+        },
+        "y2": {
+          "default": 0.0,
+          "title": "Y2",
+          "type": "number"
+        }
+      },
+      "title": "BoundingBox",
+      "type": "object"
+    },
+    "IRBlock": {
+      "description": "A single structural element extracted from a PDF page.\n\nThe ``attributes`` dict carries type-specific data:\n- heading: {\"level\": 1}\n- table:   {\"headers\": [...], \"rows\": [[...], ...]}\n- image:   {\"alt\": \"...\", \"src\": \"...\"}\n- list:    {\"items\": [...]}",
+      "properties": {
+        "block_id": {
+          "title": "Block Id",
+          "type": "string"
+        },
+        "block_type": {
+          "$ref": "#/$defs/BlockType"
+        },
+        "content": {
+          "default": "",
+          "title": "Content",
+          "type": "string"
+        },
+        "bbox": {
+          "$ref": "#/$defs/BoundingBox"
+        },
+        "page_num": {
+          "default": 0,
+          "title": "Page Num",
+          "type": "integer"
+        },
+        "confidence": {
+          "default": 1.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "source": {
+          "$ref": "#/$defs/BlockSource",
+          "default": "adobe"
+        },
+        "wcag_criteria": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Wcag Criteria",
+          "type": "array"
+        },
+        "remediation_status": {
+          "$ref": "#/$defs/RemediationStatus",
+          "default": "raw"
+        },
+        "attributes": {
+          "additionalProperties": true,
+          "title": "Attributes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "block_type"
+      ],
+      "title": "IRBlock",
+      "type": "object"
+    },
+    "IRPage": {
+      "description": "One page of a document, containing ordered blocks.",
+      "properties": {
+        "page_num": {
+          "title": "Page Num",
+          "type": "integer"
+        },
+        "width": {
+          "default": 612.0,
+          "title": "Width",
+          "type": "number"
+        },
+        "height": {
+          "default": 792.0,
+          "title": "Height",
+          "type": "number"
+        },
+        "blocks": {
+          "items": {
+            "$ref": "#/$defs/IRBlock"
+          },
+          "title": "Blocks",
+          "type": "array"
+        },
+        "has_extractable_text": {
+          "default": true,
+          "title": "Has Extractable Text",
+          "type": "boolean"
+        },
+        "text_coverage_ratio": {
+          "default": 1.0,
+          "title": "Text Coverage Ratio",
+          "type": "number"
+        },
+        "image_coverage_ratio": {
+          "default": 0.0,
+          "title": "Image Coverage Ratio",
+          "type": "number"
+        },
+        "extraction_method": {
+          "default": "adobe",
+          "title": "Extraction Method",
+          "type": "string"
+        }
+      },
+      "required": [
+        "page_num"
+      ],
+      "title": "IRPage",
+      "type": "object"
+    },
+    "RemediationStatus": {
+      "enum": [
+        "raw",
+        "ai_drafted",
+        "human_reviewed",
+        "approved",
+        "flagged"
+      ],
+      "title": "RemediationStatus",
+      "type": "string"
+    }
+  },
+  "description": "Top-level intermediate representation for a PDF document.\n\nThis is the single interchange format between all pipeline stages.",
+  "properties": {
+    "document_id": {
+      "title": "Document Id",
+      "type": "string"
+    },
+    "filename": {
+      "title": "Filename",
+      "type": "string"
+    },
+    "page_count": {
+      "default": 0,
+      "title": "Page Count",
+      "type": "integer"
+    },
+    "pages": {
+      "items": {
+        "$ref": "#/$defs/IRPage"
+      },
+      "title": "Pages",
+      "type": "array"
+    },
+    "created_at": {
+      "title": "Created At",
+      "type": "string"
+    },
+    "language": {
+      "default": "en",
+      "title": "Language",
+      "type": "string"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "document_id",
+    "filename"
+  ],
+  "title": "IRDocument",
+  "type": "object"
+}

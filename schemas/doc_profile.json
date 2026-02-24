@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DocumentProfile",
+  "description": "Per-page OCR routing decisions for a PDF document.",
+  "type": "object",
+  "required": ["filename", "page_count", "pages", "overall_route"],
+  "properties": {
+    "filename": { "type": "string" },
+    "page_count": { "type": "integer", "minimum": 0 },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["page_num", "has_extractable_text", "text_coverage_ratio", "image_coverage_ratio", "route"],
+        "properties": {
+          "page_num": { "type": "integer", "minimum": 0 },
+          "has_extractable_text": { "type": "boolean" },
+          "text_coverage_ratio": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "image_coverage_ratio": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "route": { "type": "string", "enum": ["adobe", "ocr"] },
+          "char_count": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "overall_route": {
+      "type": "string",
+      "enum": ["all_adobe", "all_ocr", "mixed"]
+    }
+  }
+}

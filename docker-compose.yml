@@ -1,0 +1,12 @@
+# Development environment with VeraPDF for PDF/UA-1 validation.
+# Usage: docker compose up verapdf
+services:
+  verapdf:
+    image: verapdf/rest:latest
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

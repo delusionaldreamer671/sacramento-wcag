@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ValidationLedger",
+  "description": "Accumulated validation gate results for a single document.",
+  "type": "object",
+  "required": ["document_id", "filename", "timestamp", "gates", "summary"],
+  "properties": {
+    "document_id": { "type": "string" },
+    "filename": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gate_id", "passed", "checks"],
+        "properties": {
+          "gate_id": { "type": "string", "enum": ["G1", "G2", "G3", "G4"] },
+          "passed": { "type": "boolean" },
+          "retry_count": { "type": "integer", "minimum": 0, "default": 0 },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["gate_id", "check_name", "status", "severity"],
+              "properties": {
+                "gate_id": { "type": "string" },
+                "check_name": { "type": "string" },
+                "status": { "type": "string", "enum": ["pass", "soft_fail", "hard_fail"] },
+                "severity": { "type": "string", "enum": ["critical", "serious", "moderate", "minor"] },
+                "details": { "type": "string", "default": "" },
+                "timestamp": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_checks", "passed", "soft_fails", "hard_fails", "overall"],
+      "properties": {
+        "total_checks": { "type": "integer" },
+        "passed": { "type": "integer" },
+        "soft_fails": { "type": "integer" },
+        "hard_fails": { "type": "integer" },
+        "overall": { "type": "string", "enum": ["pass", "fail"] }
+      }
+    }
+  }
+}

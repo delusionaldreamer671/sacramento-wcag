@@ -1,0 +1,74 @@
+{
+  "2019 SCTDF TIF -Nexus Study With App A-H.pdf": {
+    "score": 0.8,
+    "classification": "YELLOW",
+    "gap_count": 114,
+    "status": "ok"
+  },
+  "BLApp.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 6,
+    "status": "ok"
+  },
+  "BOARD_OF_SUPERVISORS_10211_Agenda_2_10_2026_9_30_00_AM.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 1,
+    "status": "ok"
+  },
+  "Final LRSP_04-6-2022_Updated.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 2,
+    "status": "ok"
+  },
+  "FY 24-25 Five-Year Report And TIF Five-Year Report For Fiscal Years 2020-2025 2020-21 \u2013 2024-25.pdf": {
+    "score": 1.0,
+    "classification": "GREEN",
+    "gap_count": 0,
+    "status": "ok"
+  },
+  "General Plan Update 2030 FEIR Vol III.pdf": {
+    "score": 0.8,
+    "classification": "YELLOW",
+    "gap_count": 2,
+    "status": "ok"
+  },
+  "non-cutting_Consulting_Arborist_Sacramento_Area.pdf": {
+    "score": 1.0,
+    "classification": "GREEN",
+    "gap_count": 0,
+    "status": "ok"
+  },
+  "SacCounty_FireDistricts.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 1,
+    "status": "ok"
+  },
+  "SB205_Fillable_Form.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 1,
+    "status": "ok"
+  },
+  "SCTDF Fee District Map.pdf": {
+    "score": 0.8,
+    "classification": "YELLOW",
+    "gap_count": 2,
+    "status": "ok"
+  },
+  "SCTDF TIF Fees Tables -Acella Effective 3-31-25.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 3,
+    "status": "ok"
+  },
+  "Tree_Permit_Application.pdf": {
+    "score": 0.9,
+    "classification": "GREEN",
+    "gap_count": 2,
+    "status": "ok"
+  }
+}

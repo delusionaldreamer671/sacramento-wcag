@@ -1,0 +1,10 @@
+{
+  "name": "sacramento-wcag",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sacramento County WCAG 2.1 AA PDF Remediation Pipeline",
+  "scripts": {
+    "test": "python -m pytest tests/ -x -q",
+    "lint": "python -m py_compile services/ingestion/main.py"
+  }
+}
