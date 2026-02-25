@@ -162,10 +162,15 @@ export async function fetchHealth(): Promise<PipelineHealthResponse> {
  * Note: This may take 30-90 seconds depending on document size and AI processing.
  * The endpoint runs the full pipeline synchronously (Adobe Extract → AI → build output).
  */
+export interface ConvertResult {
+  blob: Blob;
+  taskId: string | null;
+}
+
 export async function uploadAndConvert(
   file: File,
   outputFormat: "html" | "pdf" = "html",
-): Promise<Blob> {
+): Promise<ConvertResult> {
   if (!file) throw new Error("uploadAndConvert: file is required");
 
   const formData = new FormData();
@@ -194,10 +199,141 @@ export async function uploadAndConvert(
     );
   }
 
-  return response.blob();
+  const taskId = response.headers.get("X-Task-Id");
+  const blob = await response.blob();
+  return { blob, taskId };
+}
+
+export interface RemediationEvent {
+  id: string;
+  component: string;
+  element_id: string;
+  before: unknown;
+  after: unknown;
+  source: string;
+  timestamp: string;
+}
+
+export interface RemediationReport {
+  task_id: string;
+  event_count: number;
+  events: RemediationEvent[];
+}
+
+export async function fetchRemediationReport(
+  taskId: string,
+): Promise<RemediationReport> {
+  return request<RemediationReport>(`/api/${encodeURIComponent(taskId)}/fixes-applied`);
 }
 
 export { APIError };
+
+// --- Analysis API (3-step flow) ---
+
+export interface AnalysisProposal {
+  id: string;
+  category: string;
+  wcag_criterion: string;
+  element_type: string;
+  element_id: string;
+  description: string;
+  proposed_fix: string;
+  severity: string;
+  page: number;
+  auto_fixable: boolean;
+}
+
+export interface AnalysisSummary {
+  total_issues: number;
+  critical: number;
+  serious: number;
+  moderate: number;
+  auto_fixable: number;
+  needs_review: number;
+}
+
+export interface AnalysisResult {
+  task_id: string;
+  filename: string;
+  page_count: number;
+  proposals: AnalysisProposal[];
+  summary: AnalysisSummary;
+}
+
+/**
+ * Upload a PDF and analyze it for WCAG accessibility issues.
+ * Returns a list of proposals without applying any remediations.
+ */
+export async function analyzeDocument(file: File): Promise<AnalysisResult> {
+  if (!file) throw new Error("analyzeDocument: file is required");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const url = `${BASE_URL}/api/analyze`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      // ignore parse error — use statusText fallback
+    }
+    throw new APIError(
+      response.status,
+      response.statusText,
+      `Analysis failed: ${response.status} ${detail}`,
+    );
+  }
+
+  return response.json() as Promise<AnalysisResult>;
+}
+
+/**
+ * Upload a PDF and apply remediations, returning the accessible output.
+ * Returns a Blob that can be downloaded directly via URL.createObjectURL().
+ */
+export async function remediateDocument(
+  file: File,
+  outputFormat: "html" | "pdf" = "html",
+): Promise<ConvertResult> {
+  if (!file) throw new Error("remediateDocument: file is required");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const url = `${BASE_URL}/api/remediate?output_format=${encodeURIComponent(outputFormat)}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      // ignore parse error — use statusText fallback
+    }
+    throw new APIError(
+      response.status,
+      response.statusText,
+      `Remediation failed: ${response.status} ${detail}`,
+    );
+  }
+
+  const taskId = response.headers.get("X-Task-Id");
+  const blob = await response.blob();
+  return { blob, taskId };
+}
 
 // --- Proposals API ---
 

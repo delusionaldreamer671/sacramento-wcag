@@ -9,17 +9,21 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from services.common import gcs_client, pubsub_client
 from services.common.config import settings
 from services.common.database import get_db
+from services.common.ir import BlockType, IRDocument
 from services.ingestion.converter import ValidationBlockedError
 from services.common.models import (
     DocumentStatus,
@@ -354,16 +358,18 @@ async def convert_document(
 
     from services.ingestion.converter import convert_pdf_sync
 
+    task_id = ""
+
     if output_format == "zip":
         # Generate both HTML and PDF, then bundle them into a ZIP archive.
         try:
-            html_bytes, _ = await asyncio.to_thread(
+            html_bytes, _, task_id = await asyncio.to_thread(
                 convert_pdf_sync,
                 contents,
                 filename,
                 "html",
             )
-            pdf_bytes, _ = await asyncio.to_thread(
+            pdf_bytes, _, _ = await asyncio.to_thread(
                 convert_pdf_sync,
                 contents,
                 filename,
@@ -396,7 +402,7 @@ async def convert_document(
         disposition = f'attachment; filename="{stem}_remediated.zip"'
     else:
         try:
-            output_bytes, content_type = await asyncio.to_thread(
+            output_bytes, content_type, task_id = await asyncio.to_thread(
                 convert_pdf_sync,
                 contents,
                 filename,
@@ -425,5 +431,342 @@ async def convert_document(
     return Response(
         content=output_bytes,
         media_type=content_type,
-        headers={"Content-Disposition": disposition},
+        headers={
+            "Content-Disposition": disposition,
+            "X-Task-Id": task_id,
+            "Access-Control-Expose-Headers": "X-Task-Id",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Analysis models
+# ---------------------------------------------------------------------------
+
+_GENERIC_ALT_RE = re.compile(
+    r"^\[Figure on page .+ — alt text requires review\]$"
+)
+
+
+class AnalysisProposal(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    category: str
+    wcag_criterion: str
+    element_type: str
+    element_id: str
+    description: str
+    proposed_fix: str
+    severity: str
+    page: int
+    auto_fixable: bool
+
+
+class AnalysisSummary(BaseModel):
+    total_issues: int = 0
+    critical: int = 0
+    serious: int = 0
+    moderate: int = 0
+    auto_fixable: int = 0
+    needs_review: int = 0
+
+
+class AnalysisResult(BaseModel):
+    task_id: str
+    filename: str
+    page_count: int
+    proposals: list[AnalysisProposal]
+    summary: AnalysisSummary
+
+
+def _analyze_ir_document(ir_doc: IRDocument) -> list[AnalysisProposal]:
+    """Walk an IRDocument and identify WCAG gaps, returning proposals."""
+    proposals: list[AnalysisProposal] = []
+
+    all_blocks = ir_doc.all_blocks()
+
+    # --- 1. Missing alt text (WCAG 1.1.1) ---
+    images = [b for b in all_blocks if b.block_type == BlockType.IMAGE]
+    for img in images:
+        alt = img.attributes.get("alt", "")
+        if not alt or _GENERIC_ALT_RE.match(alt):
+            proposals.append(AnalysisProposal(
+                category="alt_text",
+                wcag_criterion="1.1.1",
+                element_type="image",
+                element_id=img.block_id,
+                description=f"Image on page {img.page_num} has no descriptive alt text",
+                proposed_fix="AI will generate contextual alt text based on surrounding content",
+                severity="critical",
+                page=img.page_num,
+                auto_fixable=True,
+            ))
+
+    # --- 2. Heading hierarchy (WCAG 2.4.6) ---
+    headings = [b for b in all_blocks if b.block_type == BlockType.HEADING]
+    if not headings and ir_doc.page_count > 1:
+        # Multi-page document with no headings at all
+        proposals.append(AnalysisProposal(
+            category="heading_hierarchy",
+            wcag_criterion="2.4.6",
+            element_type="document",
+            element_id="document-level",
+            description="Document has no headings — screen readers cannot navigate by structure",
+            proposed_fix="Headings will be inferred from text formatting (font size, weight)",
+            severity="serious",
+            page=1,
+            auto_fixable=True,
+        ))
+    else:
+        # Check for skipped heading levels (e.g., h1 -> h3)
+        prev_level = 0
+        for h in headings:
+            level = h.attributes.get("level", 1)
+            if isinstance(level, str):
+                try:
+                    level = int(level)
+                except ValueError:
+                    level = 1
+            if prev_level > 0 and level > prev_level + 1:
+                proposals.append(AnalysisProposal(
+                    category="heading_hierarchy",
+                    wcag_criterion="2.4.6",
+                    element_type="heading",
+                    element_id=h.block_id,
+                    description=(
+                        f"Heading level skips from h{prev_level} to h{level} "
+                        f"on page {h.page_num}"
+                    ),
+                    proposed_fix=f"Heading will be adjusted to h{prev_level + 1} to maintain hierarchy",
+                    severity="serious",
+                    page=h.page_num,
+                    auto_fixable=True,
+                ))
+            prev_level = level
+
+    # --- 3. Table structure (WCAG 1.3.1) ---
+    tables = [b for b in all_blocks if b.block_type == BlockType.TABLE]
+    for tbl in tables:
+        headers = tbl.attributes.get("headers", [])
+        rows = tbl.attributes.get("rows", [])
+        row_count = len(rows) if isinstance(rows, list) else 0
+        if not headers:
+            # Determine complexity
+            is_complex = row_count > 20
+            proposals.append(AnalysisProposal(
+                category="table_structure",
+                wcag_criterion="1.3.1",
+                element_type="table",
+                element_id=tbl.block_id,
+                description=(
+                    f"Table on page {tbl.page_num} has no header associations "
+                    f"({row_count} rows)"
+                ),
+                proposed_fix=(
+                    "First row will be designated as header row with proper <th> markup"
+                    if not is_complex
+                    else "Complex table — headers will be inferred but may need manual review"
+                ),
+                severity="serious" if not is_complex else "critical",
+                page=tbl.page_num,
+                auto_fixable=not is_complex,
+            ))
+
+    # --- 4. Language tag (WCAG 3.1.1) ---
+    # The pipeline always sets the language tag, but we report it as a
+    # proposal so the user sees it as a remediation step.
+    proposals.append(AnalysisProposal(
+        category="language",
+        wcag_criterion="3.1.1",
+        element_type="document",
+        element_id="document-lang",
+        description="Document language tag will be set to ensure assistive technology reads content correctly",
+        proposed_fix=f"Language attribute will be set to '{ir_doc.language}'",
+        severity="moderate",
+        page=1,
+        auto_fixable=True,
+    ))
+
+    # --- 5. Reading order (WCAG 1.3.2) ---
+    # Detect multi-column layouts or pages with many overlapping bboxes
+    for page in ir_doc.pages:
+        blocks = page.blocks
+        if len(blocks) < 2:
+            continue
+        # Simple heuristic: if blocks have bboxes that overlap horizontally
+        # (different columns) this may indicate reading order issues
+        x_positions = sorted(set(
+            round(b.bbox.x1, -1) for b in blocks if b.bbox.x1 > 0
+        ))
+        if len(x_positions) >= 3:
+            proposals.append(AnalysisProposal(
+                category="reading_order",
+                wcag_criterion="1.3.2",
+                element_type="page",
+                element_id=f"page-{page.page_num}",
+                description=(
+                    f"Page {page.page_num} appears to have a multi-column layout "
+                    f"— reading order may need verification"
+                ),
+                proposed_fix="Reading order will be set based on extracted element sequence",
+                severity="moderate",
+                page=page.page_num,
+                auto_fixable=True,
+            ))
+
+    return proposals
+
+
+# ---------------------------------------------------------------------------
+# Analyze endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/analyze",
+    response_model=AnalysisResult,
+    summary="Analyze a PDF for WCAG accessibility issues",
+    description=(
+        "Uploads a PDF, extracts its structure, and identifies WCAG 2.1 AA "
+        "gaps without applying any remediations. Returns a list of proposals "
+        "that the user can review before choosing to remediate."
+    ),
+)
+async def analyze_document(
+    file: UploadFile = File(..., description="PDF file to analyze"),
+) -> AnalysisResult:
+    _validate_pdf(file)
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    filename = file.filename or "document.pdf"
+    logger.info(
+        "Analyze request: filename=%s size=%d bytes",
+        filename,
+        len(contents),
+    )
+
+    from services.ingestion.converter import stage_extract
+
+    try:
+        ir_doc = await asyncio.to_thread(stage_extract, contents, filename)
+    except Exception as exc:
+        logger.exception("Extraction failed for %s", filename)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"PDF extraction failed: {exc}",
+        ) from exc
+
+    proposals = _analyze_ir_document(ir_doc)
+
+    # Build summary counts
+    severity_counts: dict[str, int] = {"critical": 0, "serious": 0, "moderate": 0}
+    auto_fixable_count = 0
+    needs_review_count = 0
+    for p in proposals:
+        if p.severity in severity_counts:
+            severity_counts[p.severity] += 1
+        if p.auto_fixable:
+            auto_fixable_count += 1
+        else:
+            needs_review_count += 1
+
+    task_id = str(uuid.uuid4())
+
+    return AnalysisResult(
+        task_id=task_id,
+        filename=filename,
+        page_count=ir_doc.page_count,
+        proposals=proposals,
+        summary=AnalysisSummary(
+            total_issues=len(proposals),
+            critical=severity_counts["critical"],
+            serious=severity_counts["serious"],
+            moderate=severity_counts["moderate"],
+            auto_fixable=auto_fixable_count,
+            needs_review=needs_review_count,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Remediate endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/remediate",
+    summary="Apply approved remediations and return accessible document",
+    description=(
+        "Accepts a PDF file and a list of approved proposal IDs, runs the "
+        "full remediation pipeline, and returns the accessible output. "
+        "For the POC, all remediations are applied regardless of the "
+        "approved_ids list (selective application requires a major refactor)."
+    ),
+)
+async def remediate_document(
+    file: UploadFile = File(..., description="PDF file to remediate"),
+    output_format: Literal["html", "pdf"] = Query(
+        default="html", description="Output format: html or pdf"
+    ),
+) -> Response:
+    _validate_pdf(file)
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    filename = file.filename or "document.pdf"
+    stem = Path(filename).stem
+    logger.info(
+        "Remediate request: filename=%s size=%d bytes format=%s",
+        filename,
+        len(contents),
+        output_format,
+    )
+
+    from services.ingestion.converter import convert_pdf_sync
+
+    try:
+        output_bytes, content_type, task_id = await asyncio.to_thread(
+            convert_pdf_sync,
+            contents,
+            filename,
+            output_format,
+        )
+    except ValidationBlockedError as exc:
+        logger.warning(
+            "Validation blocked output for %s: %s", filename, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": str(exc),
+                "violations": exc.violations,
+            },
+        ) from exc
+    except Exception as exc:
+        logger.exception("Remediation failed for %s", filename)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Remediation failed: {exc}",
+        ) from exc
+
+    disposition = f'attachment; filename="{stem}_remediated.{output_format}"'
+
+    return Response(
+        content=output_bytes,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": disposition,
+            "X-Task-Id": task_id,
+            "Access-Control-Expose-Headers": "X-Task-Id",
+        },
     )

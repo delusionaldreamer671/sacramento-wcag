@@ -8,6 +8,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 import type { DocumentStatus } from "@/lib/types";
+import { AuditTrail } from "@/components/audit-trail";
 
 interface DocumentPageProps {
   params: { id: string };
@@ -99,85 +100,101 @@ export default async function DocumentPage({ params }: DocumentPageProps) {
       </nav>
 
       {doc ? (
-        <article aria-labelledby="doc-heading">
-          <div className="rounded-lg border border-border bg-card p-6 space-y-4">
-            <header className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-              <div>
-                <h1
-                  id="doc-heading"
-                  className="text-lg font-bold text-foreground break-all"
-                >
-                  {doc.filename}
-                </h1>
-                <p className="mt-0.5 text-xs font-mono text-muted-foreground">
-                  ID: {doc.document_id}
-                </p>
-              </div>
-              <span
-                className={cn(
-                  "status-badge border self-start shrink-0",
-                  STATUS_COLORS[doc.status],
-                )}
-              >
-                {STATUS_LABELS[doc.status]}
-              </span>
-            </header>
-
-            <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
-              <div>
-                <dt className="font-medium text-muted-foreground">Pages</dt>
-                <dd className="mt-0.5 text-foreground">
-                  {doc.page_count > 0 ? doc.page_count : "Unknown"}
-                </dd>
-              </div>
-              <div>
-                <dt className="font-medium text-muted-foreground">Created</dt>
-                <dd className="mt-0.5 text-foreground">
-                  <time dateTime={doc.created_at}>
-                    {new Date(doc.created_at).toLocaleString()}
-                  </time>
-                </dd>
-              </div>
-              <div>
-                <dt className="font-medium text-muted-foreground">Updated</dt>
-                <dd className="mt-0.5 text-foreground">
-                  <time dateTime={doc.updated_at}>
-                    {new Date(doc.updated_at).toLocaleString()}
-                  </time>
-                </dd>
-              </div>
-            </dl>
-
-            {(doc.status === "hitl_review" || doc.status === "approved") && (
-              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-                <p className="text-sm font-medium text-amber-800">
-                  Human review required
-                </p>
-                <p className="mt-1 text-xs text-amber-700">
-                  This document requires at least one human review action before
-                  it can be marked as complete. Automated validation alone is not
-                  sufficient for WCAG 2.1 AA compliance.
-                </p>
-              </div>
-            )}
-
-            {doc.status === "hitl_review" && (
-              <div className="pt-2">
-                <Link
-                  href={`/review/${doc.document_id}`}
+        <>
+          <article aria-labelledby="doc-heading">
+            <div className="rounded-lg border border-border bg-card p-6 space-y-4">
+              <header className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <h1
+                    id="doc-heading"
+                    className="text-lg font-bold text-foreground break-all"
+                  >
+                    {doc.filename}
+                  </h1>
+                  <p className="mt-0.5 text-xs font-mono text-muted-foreground">
+                    ID: {doc.document_id}
+                  </p>
+                </div>
+                <span
                   className={cn(
-                    "inline-flex items-center rounded-md px-4 py-2 text-sm font-medium",
-                    "bg-primary text-primary-foreground",
-                    "hover:bg-primary/90 focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2",
-                    "transition-colors",
+                    "status-badge border self-start shrink-0",
+                    STATUS_COLORS[doc.status],
                   )}
                 >
-                  Start Review
-                </Link>
-              </div>
-            )}
-          </div>
-        </article>
+                  {STATUS_LABELS[doc.status]}
+                </span>
+              </header>
+
+              <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
+                <div>
+                  <dt className="font-medium text-muted-foreground">Pages</dt>
+                  <dd className="mt-0.5 text-foreground">
+                    {doc.page_count > 0 ? doc.page_count : "Unknown"}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-medium text-muted-foreground">Created</dt>
+                  <dd className="mt-0.5 text-foreground">
+                    <time dateTime={doc.created_at}>
+                      {new Date(doc.created_at).toLocaleString()}
+                    </time>
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-medium text-muted-foreground">Updated</dt>
+                  <dd className="mt-0.5 text-foreground">
+                    <time dateTime={doc.updated_at}>
+                      {new Date(doc.updated_at).toLocaleString()}
+                    </time>
+                  </dd>
+                </div>
+              </dl>
+
+              {(doc.status === "hitl_review" || doc.status === "approved") && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                  <p className="text-sm font-medium text-amber-800">
+                    Human review required
+                  </p>
+                  <p className="mt-1 text-xs text-amber-700">
+                    This document requires at least one human review action before
+                    it can be marked as complete. Automated validation alone is not
+                    sufficient for WCAG 2.1 AA compliance.
+                  </p>
+                </div>
+              )}
+
+              {doc.status === "hitl_review" && (
+                <div className="pt-2">
+                  <Link
+                    href={`/review/${doc.document_id}`}
+                    className={cn(
+                      "inline-flex items-center rounded-md px-4 py-2 text-sm font-medium",
+                      "bg-primary text-primary-foreground",
+                      "hover:bg-primary/90 focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2",
+                      "transition-colors",
+                    )}
+                  >
+                    Start Review
+                  </Link>
+                </div>
+              )}
+            </div>
+          </article>
+
+          {/* Audit Trail */}
+          <section
+            aria-labelledby="audit-trail-heading"
+            className="rounded-lg border border-border bg-card p-6"
+          >
+            <h2
+              id="audit-trail-heading"
+              className="text-base font-semibold text-foreground mb-4"
+            >
+              Document History
+            </h2>
+            <AuditTrail entityType="document" entityId={doc.document_id} />
+          </section>
+        </>
       ) : (
         <div
           role="alert"

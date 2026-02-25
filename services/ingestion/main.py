@@ -29,6 +29,7 @@ from services.ingestion.api_proposals import router as proposals_router
 from services.ingestion.api_rules import router as rules_router
 from services.ingestion.api_audit import router as audit_router
 from services.ingestion.api_fixes import router as fixes_router
+from services.ingestion.api_review_items import router as review_items_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,6 +67,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Task-Id"],
 )
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,7 @@ app.include_router(proposals_router)
 app.include_router(rules_router)
 app.include_router(audit_router)
 app.include_router(fixes_router)
+app.include_router(review_items_router)
 
 # ---------------------------------------------------------------------------
 # Health check (at root level, outside /api prefix)

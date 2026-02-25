@@ -7,6 +7,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ReviewPanel } from "@/components/review-panel";
+import { ChangeProposalForm } from "@/components/change-proposal-form";
 import { cn } from "@/lib/utils";
 
 interface ReviewPageProps {
@@ -73,6 +74,45 @@ export default function ReviewPage({ params, searchParams }: ReviewPageProps) {
         initialItemId={initialItemId}
         reviewerId="county-reviewer"
       />
+
+      {/* Change proposal section */}
+      <section aria-labelledby="change-proposal-heading">
+        <details className="group rounded-lg border border-border bg-card">
+          <summary
+            className={cn(
+              "flex cursor-pointer list-none items-center justify-between px-5 py-4",
+              "text-sm font-medium text-foreground select-none",
+              "hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2",
+              "focus-visible:ring-ring focus-visible:ring-inset transition-colors",
+            )}
+            id="change-proposal-heading"
+          >
+            <span>Propose a Change to This Document</span>
+            {/* Chevron rotates when open */}
+            <svg
+              className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+              aria-hidden="true"
+            >
+              <path
+                fillRule="evenodd"
+                d="M5.22 8.22a.75.75 0 0 1 1.06 0L10 11.94l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 9.28a.75.75 0 0 1 0-1.06Z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </summary>
+          <div className="border-t border-border px-5 py-4">
+            <p className="mb-4 text-xs text-muted-foreground">
+              Use this form to suggest a change to the remediation approach for this
+              document. Your proposal will be evaluated against WCAG 2.1 AA compliance
+              requirements before being applied.
+            </p>
+            <ChangeProposalForm documentId={documentId} />
+          </div>
+        </details>
+      </section>
     </div>
   );
 }
