@@ -58,8 +58,12 @@ async function request<T>(
   if (!response.ok) {
     let detail = response.statusText;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = (await response.json()) as { detail?: string | { message?: string } };
+      if (body.detail) {
+        detail = typeof body.detail === "string"
+          ? body.detail
+          : body.detail.message ?? JSON.stringify(body.detail);
+      }
     } catch {
       // ignore parse error — use statusText fallback
     }
@@ -187,8 +191,12 @@ export async function uploadAndConvert(
   if (!response.ok) {
     let detail = response.statusText;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = (await response.json()) as { detail?: string | { message?: string } };
+      if (body.detail) {
+        detail = typeof body.detail === "string"
+          ? body.detail
+          : body.detail.message ?? JSON.stringify(body.detail);
+      }
     } catch {
       // ignore parse error — use statusText fallback
     }
@@ -280,8 +288,12 @@ export async function analyzeDocument(file: File): Promise<AnalysisResult> {
   if (!response.ok) {
     let detail = response.statusText;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = (await response.json()) as { detail?: string | { message?: string } };
+      if (body.detail) {
+        detail = typeof body.detail === "string"
+          ? body.detail
+          : body.detail.message ?? JSON.stringify(body.detail);
+      }
     } catch {
       // ignore parse error — use statusText fallback
     }
@@ -318,8 +330,12 @@ export async function remediateDocument(
   if (!response.ok) {
     let detail = response.statusText;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = (await response.json()) as { detail?: string | { message?: string } };
+      if (body.detail) {
+        detail = typeof body.detail === "string"
+          ? body.detail
+          : body.detail.message ?? JSON.stringify(body.detail);
+      }
     } catch {
       // ignore parse error — use statusText fallback
     }

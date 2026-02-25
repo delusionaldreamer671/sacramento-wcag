@@ -1190,7 +1190,11 @@ class PDFUABuilder:
                 }
             )
 
-        # --- Placeholder text detection (SERIOUS) ---
+        # --- Placeholder text detection (WARNING — not blocking) ---
+        # Placeholder alt text is EXPECTED in a HITL pipeline: images get
+        # placeholder text during automated remediation, then human reviewers
+        # replace it.  Blocking on placeholders would prevent the document
+        # from ever reaching the HITL review step.
         placeholder_patterns = [
             r"\[Figure on page \d+ — alt text requires review\]",
             r"\[This figure contains complex visual information that requires",
@@ -1206,18 +1210,16 @@ class PDFUABuilder:
             violations.append(
                 {
                     "criterion": "1.1.1",
-                    "severity": "serious",
-                    "violation_class": "serious",
+                    "severity": "moderate",
+                    "violation_class": "warning",
                     "description": (
                         f"{placeholder_count} placeholder text occurrence(s) found in output. "
-                        "These indicate unfinished remediation that requires human review."
+                        "These are queued for human review in the HITL dashboard."
                     ),
                 }
             )
-            if placeholder_count > 5:
-                serious_violation_labels.append(
-                    f"{placeholder_count} placeholder texts remain in output"
-                )
+            # Log but do NOT add to serious_violation_labels — placeholders
+            # must not block delivery in a HITL pipeline.
         else:
             total_checks += 1
             passed_checks += 1
