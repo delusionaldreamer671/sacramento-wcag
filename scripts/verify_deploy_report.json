@@ -1,10 +1,10 @@
 {
   "url": "https://sacto-wcag-api-738802459862.us-central1.run.app",
-  "timestamp": "2026-02-26T11:18:14Z",
-  "revision": "sacto-wcag-api-00034-vfn",
+  "timestamp": "2026-02-26T15:44:56Z",
+  "revision": "sacto-wcag-api-00037-nnx",
   "all_passed": true,
-  "total": 51,
-  "passed": 51,
+  "total": 59,
+  "passed": 59,
   "failed": 0,
   "checks": [
     {
@@ -100,7 +100,7 @@
     {
       "name": "Test PDF created",
       "passed": true,
-      "detail": "1520 bytes",
+      "detail": "2033 bytes",
       "category": "analyze"
     },
     {
@@ -112,7 +112,7 @@
     {
       "name": "Response has task_id",
       "passed": true,
-      "detail": "task_id=c271a9c2-331a-4d33-9d45-056edc7ad788",
+      "detail": "task_id=23b63d56-2073-407c-9d90-4fcbd1bd9aaa",
       "category": "analyze"
     },
     {
@@ -184,7 +184,7 @@
     {
       "name": "Proposals is a list",
       "passed": true,
-      "detail": "type=list, count=3",
+      "detail": "type=list, count=1",
       "category": "analyze"
     },
     {
@@ -196,19 +196,19 @@
     {
       "name": "X-Task-Id header present",
       "passed": true,
-      "detail": "x-task-id=9b0fdaf8-a72f-422a-9040-e8fbe0bd28cb",
+      "detail": "x-task-id=5b62470f-acab-4292-b316-ba6c8e66c8a1",
       "category": "remediate"
     },
     {
       "name": "X-Pipeline-Metadata header present",
       "passed": true,
-      "detail": "length=803",
+      "detail": "length=965",
       "category": "remediate"
     },
     {
       "name": "X-Pipeline-Metadata is valid JSON",
       "passed": true,
-      "detail": "stages=4",
+      "detail": "stages=5",
       "category": "remediate"
     },
     {
@@ -220,7 +220,7 @@
     {
       "name": "X-Remediation-Delta header present",
       "passed": true,
-      "detail": "value={\"after_failed\": 3, \"after_passed\": 17}",
+      "detail": "value={\"before_failed\": null, \"before_passed\": null, \"after_failed\": 1, \"after_passed\": 18}",
       "category": "remediate"
     },
     {
@@ -272,9 +272,9 @@
       "category": "db_backend"
     },
     {
-      "name": "Database detail field present",
+      "name": "Database detail field (up \u2014 detail optional)",
       "passed": true,
-      "detail": "detail=(no detail key \u2014 non-blocking)",
+      "detail": "detail=(none \u2014 acceptable when up)",
       "category": "db_backend"
     },
     {
@@ -308,10 +308,58 @@
       "category": "gate_semantic"
     },
     {
+      "name": "Stage 'validate' success has evidence",
+      "passed": true,
+      "detail": "status=success, metadata_keys=['score', 'blocked', 'violations']",
+      "category": "gate_semantic"
+    },
+    {
       "name": "Stage 'post_remediation_audit' success has evidence",
       "passed": true,
       "detail": "status=success, metadata_keys=['rules_checked', 'rules_passed', 'rules_failed', 'coverage_pct']",
       "category": "gate_semantic"
+    },
+    {
+      "name": "Invariant 1: database probe present and not unknown",
+      "passed": true,
+      "detail": "database=up (must be up/down/degraded \u2014 never missing or unknown)",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 5: probe 'database' reported in health",
+      "passed": true,
+      "detail": "status=up",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 5: probe 'adobe_credentials' reported in health",
+      "passed": true,
+      "detail": "status=up",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 5: probe 'vertex_ai' reported in health",
+      "passed": true,
+      "detail": "status=up",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 5: probe 'verapdf' reported in health",
+      "passed": true,
+      "detail": "status=down",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 5: probe 'axe_core' reported in health",
+      "passed": true,
+      "detail": "status=down",
+      "category": "invariants"
+    },
+    {
+      "name": "Invariant 2: CORS expose-headers non-empty",
+      "passed": true,
+      "detail": "access-control-expose-headers=X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta",
+      "category": "invariants"
     }
   ]
 }
