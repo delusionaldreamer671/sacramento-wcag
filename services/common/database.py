@@ -1,13 +1,14 @@
-"""SQLite database layer for the WCAG PDF Remediation Pipeline POC.
+"""Database layer for the WCAG PDF Remediation Pipeline.
 
-Thread-safe singleton over sqlite3. JSON fields use json.dumps/loads.
-Timestamps are ISO-8601 UTC strings.
+Supports SQLite (default) and PostgreSQL via the backend abstraction layer.
+Timestamps are ISO-8601 UTC strings.  JSON fields use json.dumps/loads.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -910,6 +911,18 @@ def get_db(db_path: str = "wcag_pipeline.db") -> Database:
     global _instance
     if _instance is None:
         from services.common.config import settings
+
+        # CRITICAL-3.1: Warn loudly when SQLite is used on Cloud Run.
+        # Cloud Run uses an ephemeral (in-memory) overlay filesystem — ALL
+        # SQLite data is permanently lost when the instance restarts or scales
+        # to zero.  This is a data-loss condition, not just a performance issue.
+        if os.getenv("K_SERVICE") and settings.db_backend == "sqlite":
+            logger.critical(
+                "CRITICAL-3.1: Running SQLite on Cloud Run ephemeral disk. "
+                "ALL DATA WILL BE LOST on instance restart/scale-to-zero. "
+                "Set WCAG_DB_BACKEND=postgres and WCAG_POSTGRES_URL to persist data."
+            )
+
         if settings.db_backend == "postgres" and settings.postgres_url:
             # Fail-fast: if postgres is configured but connection fails,
             # do NOT silently fall back to ephemeral SQLite (data loss on Cloud Run).

@@ -7,6 +7,7 @@ without changing the SQL queries in database.py. The backend handles:
 - Row factory (dict rows)
 - PRAGMA handling (SQLite-only)
 - DDL execution
+- Connection pooling (PostgresBackend — ThreadedConnectionPool via queue.Queue)
 
 Usage:
     from services.common.db_backend import create_backend
@@ -18,9 +19,12 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import queue
 import re
-from typing import Any, Protocol, runtime_checkable
+import threading
+from typing import Any, Generator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -283,52 +287,283 @@ CREATE INDEX IF NOT EXISTS idx_altp_status ON alt_text_proposals(status);
 """
 
 
-class PostgresBackend:
-    """PostgreSQL backend using psycopg 3."""
+class _PostgresConnectionPool:
+    """Thread-safe connection pool for psycopg v3 (psycopg[binary]).
 
-    def __init__(self, postgres_url: str) -> None:
+    Uses a bounded queue.Queue to hold idle connections.  Each call to
+    ``acquire()`` removes a connection from the pool (blocking up to
+    ``timeout`` seconds if all connections are in use); ``release()``
+    returns it.  The context manager ``connection()`` handles acquire /
+    release automatically.
+
+    Pool parameters:
+        minconn -- connections created eagerly at startup (default 2)
+        maxconn -- hard cap on total connections (default 10)
+        timeout -- seconds to wait for a free connection before raising
+                   RuntimeError (default 30)
+    """
+
+    def __init__(self, dsn: str, minconn: int = 2, maxconn: int = 10,
+                 timeout: float = 30.0) -> None:
         try:
             import psycopg
+            from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError(
                 "psycopg is required for PostgreSQL backend. "
                 "Install with: pip install 'psycopg[binary]>=3.1.0'"
             ) from exc
 
-        self._conn = psycopg.connect(postgres_url, autocommit=False)
-        # Use dict rows
-        from psycopg.rows import dict_row
-        self._conn.row_factory = dict_row
+        self._dsn = dsn
+        self._maxconn = maxconn
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._all_conns: list[Any] = []
+        self._pool: queue.Queue[Any] = queue.Queue()
+
+        # Import stored for _make_conn
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+
+        # Eagerly open minconn connections
+        for _ in range(minconn):
+            conn = self._make_conn()
+            self._all_conns.append(conn)
+            self._pool.put(conn)
+
+        logger.info(
+            "PostgresBackend: pool initialised (minconn=%d, maxconn=%d, dsn=%s)",
+            minconn, maxconn, self._redact_dsn(dsn),
+        )
+
+    @staticmethod
+    def _redact_dsn(dsn: str) -> str:
+        """Remove password from DSN for safe logging."""
+        return re.sub(r":[^:@/]+@", ":***@", dsn)
+
+    def _make_conn(self) -> Any:
+        conn = self._psycopg.connect(self._dsn, autocommit=False)
+        conn.row_factory = self._dict_row
+        return conn
+
+    def acquire(self) -> Any:
+        """Get a connection from the pool, creating one if under maxconn."""
+        # Fast path: try to get without blocking
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            pass
+
+        # Slow path: can we create a new connection?
+        with self._lock:
+            if len(self._all_conns) < self._maxconn:
+                conn = self._make_conn()
+                self._all_conns.append(conn)
+                logger.debug(
+                    "PostgresBackend: opened new connection (%d/%d)",
+                    len(self._all_conns), self._maxconn,
+                )
+                return conn
+
+        # Pool exhausted — wait for one to become available
+        try:
+            return self._pool.get(timeout=self._timeout)
+        except queue.Empty:
+            raise RuntimeError(
+                f"PostgresBackend: connection pool exhausted after {self._timeout}s "
+                f"(maxconn={self._maxconn}). Increase maxconn or reduce concurrency."
+            )
+
+    def release(self, conn: Any) -> None:
+        """Return a connection to the pool; discard broken connections."""
+        try:
+            # Roll back any uncommitted transaction so the connection is
+            # returned in a clean state.
+            if conn.info.transaction_status != 0:  # INTRANS or ERROR
+                conn.rollback()
+            self._pool.put_nowait(conn)
+        except Exception:
+            # Connection is broken — discard it and remove from tracking
+            logger.warning("PostgresBackend: discarding broken connection", exc_info=True)
+            with self._lock:
+                try:
+                    self._all_conns.remove(conn)
+                except ValueError:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def connection(self) -> Generator[Any, None, None]:
+        """Context manager: acquire → yield → release."""
+        conn = self.acquire()
+        try:
+            yield conn
+        finally:
+            self.release(conn)
+
+    def close_all(self) -> None:
+        """Close all connections in the pool. Call on application shutdown."""
+        with self._lock:
+            conns = list(self._all_conns)
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.info("PostgresBackend: all pool connections closed")
+
+
+class PostgresBackend:
+    """PostgreSQL backend using psycopg v3 with a thread-safe connection pool.
+
+    Cloud Run runs multiple concurrent requests within a single instance.
+    A single connection would serialize all database operations; a pool
+    allows requests to run concurrently while keeping the connection count
+    bounded.
+
+    Pool defaults (minconn=2, maxconn=10) are appropriate for Cloud Run
+    instances with max-concurrency of 80 (the Cloud Run default).  The pool
+    blocks for up to 30 s before raising RuntimeError, which surfaces as a
+    503 rather than silently hanging.
+
+    Thread-local connection pinning:
+        ``database.py`` calls ``execute()`` then ``commit()`` as separate
+        method calls on the same backend instance.  To keep these two calls
+        on the *same* physical connection, each thread pins one connection
+        from the pool (stored in ``threading.local()``) on the first
+        ``execute()`` call and releases it back to the pool after
+        ``commit()``.  This matches the behaviour of the SQLiteBackend, which
+        also uses one connection per thread.
+
+        For self-contained read operations (``fetchone`` / ``fetchall``),
+        the connection is acquired, used, committed, and released within the
+        call so as not to hold a pool slot longer than necessary.
+
+    Parameter placeholders:
+        SQLite uses ``?`` as the placeholder; PostgreSQL uses ``%s``.
+        All SQL passed to this backend is translated automatically via
+        ``_translate_params()`` before execution.
+    """
+
+    def __init__(self, postgres_url: str, minconn: int = 2,
+                 maxconn: int = 10, pool_timeout: float = 30.0) -> None:
+        self._pool = _PostgresConnectionPool(
+            dsn=postgres_url,
+            minconn=minconn,
+            maxconn=maxconn,
+            timeout=pool_timeout,
+        )
+        # Thread-local storage: each thread may hold at most one connection
+        # from the pool at a time (pinned between execute() and commit()).
+        self._local = threading.local()
+
+    # ------------------------------------------------------------------
+    # Thread-local connection helpers
+    # ------------------------------------------------------------------
+
+    def _get_conn(self) -> Any:
+        """Return the thread-local pinned connection, acquiring one if needed."""
+        if getattr(self._local, "conn", None) is None:
+            self._local.conn = self._pool.acquire()
+        return self._local.conn
+
+    def _put_conn(self, *, rollback: bool = False) -> None:
+        """Release the thread-local pinned connection back to the pool.
+
+        If ``rollback=True``, roll back before releasing so the pool gets
+        a clean connection.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        if rollback:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        self._pool.release(conn)
+
+    # ------------------------------------------------------------------
+    # DatabaseBackend protocol methods
+    # ------------------------------------------------------------------
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
+        """Execute a single DML statement on the thread-local connection.
+
+        The connection stays pinned to this thread until ``commit()`` is
+        called (or an exception occurs, in which case it is released with
+        rollback).  The returned cursor object has a valid ``rowcount``
+        attribute.
+        """
         translated = _translate_params(sql)
-        return self._conn.execute(translated, params)
+        conn = self._get_conn()
+        try:
+            return conn.execute(translated, params)
+        except Exception:
+            self._put_conn(rollback=True)
+            raise
 
     def executemany(self, sql: str, params_list: list[tuple]) -> None:
+        """Execute a DML statement for each parameter tuple, then commit."""
         translated = _translate_params(sql)
-        self._conn.executemany(translated, params_list)
+        conn = self._get_conn()
+        try:
+            conn.executemany(translated, params_list)
+            conn.commit()
+        except Exception:
+            self._put_conn(rollback=True)
+            raise
+        self._put_conn()
 
     def fetchone(self, sql: str, params: tuple = ()) -> dict | None:
+        """Execute a SELECT and return the first row as a dict (or None).
+
+        Uses a fresh pool connection that is returned immediately after
+        the query — does not pin the thread-local connection.
+        """
         translated = _translate_params(sql)
-        cur = self._conn.execute(translated, params)
-        row = cur.fetchone()
+        with self._pool.connection() as conn:
+            cur = conn.execute(translated, params)
+            row = cur.fetchone()
         return dict(row) if row else None
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a SELECT and return all rows as dicts.
+
+        Uses a fresh pool connection that is returned immediately after
+        the query — does not pin the thread-local connection.
+        """
         translated = _translate_params(sql)
-        cur = self._conn.execute(translated, params)
-        return [dict(r) for r in cur.fetchall()]
+        with self._pool.connection() as conn:
+            cur = conn.execute(translated, params)
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
 
     def commit(self) -> None:
-        self._conn.commit()
+        """Commit the current transaction and release the thread-local connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            # Nothing to commit (e.g., after a fetchone/fetchall-only path)
+            return
+        try:
+            conn.commit()
+        except Exception:
+            self._put_conn(rollback=True)
+            raise
+        self._put_conn()
 
     def execute_ddl(self, ddl: str) -> None:
-        # PostgreSQL: execute each statement separately
-        for statement in ddl.split(";"):
-            stmt = statement.strip()
-            if stmt:
-                self._conn.execute(stmt)
-        self._conn.commit()
+        """Execute DDL statements (CREATE TABLE, CREATE INDEX, etc.)."""
+        with self._pool.connection() as conn:
+            for statement in ddl.split(";"):
+                stmt = statement.strip()
+                if stmt:
+                    conn.execute(stmt)
+            conn.commit()
 
     def execute_pragma(self, pragma: str) -> None:
         # PRAGMAs are SQLite-only — no-op for Postgres
@@ -337,6 +572,22 @@ class PostgresBackend:
     @property
     def backend_type(self) -> str:
         return "postgres"
+
+    # ------------------------------------------------------------------
+    # Explicit pool access (for callers that want full lifecycle control)
+    # ------------------------------------------------------------------
+
+    def _pool_get_conn(self) -> Any:
+        """Acquire a connection from the pool (caller must call _pool_put_conn)."""
+        return self._pool.acquire()
+
+    def _pool_put_conn(self, conn: Any) -> None:
+        """Return a connection to the pool."""
+        self._pool.release(conn)
+
+    # ------------------------------------------------------------------
+    # Extra Postgres-specific methods
+    # ------------------------------------------------------------------
 
     def upsert_image(
         self,
@@ -354,7 +605,13 @@ class PostgresBackend:
             "width=EXCLUDED.width, height=EXCLUDED.height, "
             "created_at=EXCLUDED.created_at"
         )
-        self._conn.execute(sql, values)
+        with self._pool.connection() as conn:
+            conn.execute(sql, values)
+            conn.commit()
+
+    def close(self) -> None:
+        """Close all pool connections. Call on application shutdown."""
+        self._pool.close_all()
 
 
 # ---------------------------------------------------------------------------

@@ -34,12 +34,13 @@ Usage in a FastAPI route:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, Header, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,100 @@ def _add_user_argon2(user_id: str, raw_token: str, role: str) -> None:
         "_cached_at": time.time(),
     }
     logger.info("Seeded user (%s): user_id=%s role=%s", alg, user_id, role)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight pipeline endpoint dependency
+# ---------------------------------------------------------------------------
+
+
+async def require_auth(authorization: Optional[str] = Header(None)) -> None:
+    """FastAPI dependency: protect pipeline endpoints that trigger paid external APIs.
+
+    Validates the Bearer token from the Authorization header against the tokens
+    configured in settings (admin_token and reviewer_token).
+
+    Bypass rule:
+        If BOTH settings.admin_token and settings.reviewer_token are empty strings
+        (i.e. no auth is configured), ALL requests are allowed through.  This
+        preserves backward compatibility for local development without a .env file.
+
+    Args:
+        authorization: Value of the ``Authorization`` HTTP header, injected by FastAPI.
+                       Expected format: ``Bearer <token>``.
+
+    Raises:
+        HTTPException 401: when auth IS configured and the token is missing,
+                           malformed, or does not match any valid token.
+
+    Usage::
+
+        from fastapi import Depends
+        from services.common.auth import require_auth
+
+        @router.post("/expensive-endpoint", dependencies=[Depends(require_auth)])
+        async def expensive_endpoint(): ...
+    """
+    from services.common.config import settings  # imported here to avoid circular deps
+
+    admin_tok = settings.admin_token
+    reviewer_tok = settings.reviewer_token
+
+    # Bypass: no tokens configured — allow all (local dev mode)
+    if not admin_tok and not reviewer_tok:
+        return
+
+    # Auth IS configured — a valid Bearer token is required
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Authentication required. "
+                "Provide a Bearer token via the Authorization header: "
+                "Authorization: Bearer <token>"
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Parse the Bearer token out of the header value
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Invalid Authorization header format. "
+                "Expected: Authorization: Bearer <token>"
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    raw_token = token.strip()
+
+    # Constant-time comparison against each configured token.
+    # Hash both sides with SHA-256 before compare_digest so that the digests
+    # are always the same length, which is required by hmac.compare_digest.
+    raw_digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    admin_match = bool(admin_tok) and hmac.compare_digest(
+        raw_digest,
+        hashlib.sha256(admin_tok.encode("utf-8")).hexdigest(),
+    )
+    reviewer_match = bool(reviewer_tok) and hmac.compare_digest(
+        raw_digest,
+        hashlib.sha256(reviewer_tok.encode("utf-8")).hexdigest(),
+    )
+
+    if not admin_match and not reviewer_match:
+        logger.warning(
+            "require_auth: rejected invalid token (prefix=%s...)",
+            raw_token[:4] if len(raw_token) >= 4 else "****",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token. Access denied.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    logger.debug("require_auth: accepted token (admin=%s reviewer=%s)", admin_match, reviewer_match)
 
 
 # ---------------------------------------------------------------------------

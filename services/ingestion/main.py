@@ -30,6 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from services.common.config import settings
 from services.common.constants import API_V1_PREFIX
+from services.common.rate_limiter import RateLimitMiddleware
 from services.common.models import PipelineHealthResponse
 from services.ingestion.router import router
 from services.ingestion.api_proposals import router as proposals_router
@@ -113,6 +114,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Task-Id", "X-Pipeline-Version", "X-Pipeline-Metadata", "X-Remediation-Delta"],
+)
+
+# Rate limiting — registered after CORS so it executes before CORS in the
+# middleware chain (Starlette applies middleware in reverse-registration order).
+# Limits are read from settings so they can be tuned via env vars without a
+# code change.
+app.add_middleware(
+    RateLimitMiddleware,
+    default_rpm=settings.rate_limit_per_minute,
+    upload_rpm=settings.rate_limit_upload_per_minute,
 )
 
 

@@ -2,9 +2,10 @@ FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
 
-# Common fonts for PDF fidelity
+# Common fonts for PDF fidelity + build deps for pycairo (reportlab dependency)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core fonts-liberation fonts-noto-core fonts-noto-cjk \
+    gcc pkg-config libcairo2-dev python3-dev \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

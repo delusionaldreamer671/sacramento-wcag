@@ -17,11 +17,12 @@ import zipfile
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.common import gcs_client, pubsub_client
+from services.common.auth import require_auth
 from services.common.config import settings
 from services.common.constants import API_V1_PREFIX
 from services.common.database import get_db
@@ -242,6 +243,7 @@ def _make_structural_id(category: str, index: int) -> str:
         "creates a PDFDocument record, and publishes a message to the "
         "extraction Pub/Sub topic to begin processing."
     ),
+    dependencies=[Depends(require_auth)],
 )
 async def upload_document(
     file: UploadFile = File(..., description="PDF file to remediate"),
@@ -1061,6 +1063,7 @@ def _analyze_html_structural(ir_doc: IRDocument, filename: str) -> list[Analysis
         "gaps without applying any remediations. Returns a list of proposals "
         "that the user can review before choosing to remediate."
     ),
+    dependencies=[Depends(require_auth)],
 )
 async def analyze_document(
     file: UploadFile = File(..., description="PDF file to analyze"),
@@ -1345,6 +1348,7 @@ class BatchAltTextApproveRequest(BaseModel):
 @router.post(
     "/alt-text-proposals/batch-approve",
     summary="Batch-approve multiple alt text proposals",
+    dependencies=[Depends(require_auth)],
 )
 def batch_approve_alt_text(body: BatchAltTextApproveRequest) -> dict:
     count = _db().batch_approve_alt_text_proposals(
@@ -1368,6 +1372,7 @@ def batch_approve_alt_text(body: BatchAltTextApproveRequest) -> dict:
         "and returns the accessible output. If approved_ids is omitted or "
         "empty, all remediations are applied (backward-compatible)."
     ),
+    dependencies=[Depends(require_auth)],
 )
 async def remediate_document(
     file: UploadFile = File(..., description="PDF file to remediate"),
