@@ -32,10 +32,19 @@ jobs:
         env:
           PYTHONPATH: .
 
+  # APPROVAL GATE — Before this job runs, a required reviewer must approve the deployment.
+  # To configure protection rules:
+  #   1. Go to repository Settings → Environments → New environment → name it "production"
+  #   2. Under "Deployment protection rules", enable "Required reviewers"
+  #   3. Add one or more reviewers (individuals or teams)
+  #   4. Optionally restrict deployments to the "main" branch only under
+  #      "Deployment branches and tags" → "Selected branches" → add "main"
+  # Until the environment exists in Settings, this job runs without an approval gate.
   deploy:
     name: Deploy to Cloud Run
-    needs: test
+    needs: [test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-${{ github.ref }}

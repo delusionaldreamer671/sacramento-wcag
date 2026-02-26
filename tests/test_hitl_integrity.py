@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import pytest
+from pydantic import SecretStr
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +278,7 @@ class TestGatesFailClosed:
             return_value=mock_pdf_services,
         ):
             mock_settings.adobe_client_id = "test-id"
-            mock_settings.adobe_client_secret = "test-secret"
+            mock_settings.adobe_client_secret = SecretStr("test-secret")
 
             from services.extraction.adobe_checker import AdobeAccessibilityChecker
             checker = AdobeAccessibilityChecker()

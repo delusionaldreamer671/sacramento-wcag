@@ -69,7 +69,7 @@ class AdobeAccessibilityChecker:
                 "Run: pip install pdfservices-sdk"
             )
 
-        if not settings.adobe_client_id or not settings.adobe_client_secret:
+        if not settings.adobe_client_id or not settings.adobe_client_secret.get_secret_value():
             raise ValueError(
                 "Adobe credentials not configured. "
                 "Set WCAG_ADOBE_CLIENT_ID and WCAG_ADOBE_CLIENT_SECRET."
@@ -77,7 +77,7 @@ class AdobeAccessibilityChecker:
 
         credentials = ServicePrincipalCredentials(
             client_id=settings.adobe_client_id,
-            client_secret=settings.adobe_client_secret,
+            client_secret=settings.adobe_client_secret.get_secret_value(),
         )
         self._pdf_services = PDFServices(credentials=credentials)
         logger.info("AdobeAccessibilityChecker initialized")

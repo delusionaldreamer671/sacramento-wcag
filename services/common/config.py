@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import warnings
 
-from pydantic import model_validator
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
 _config_logger = logging.getLogger(__name__)
@@ -39,10 +39,8 @@ class Settings(BaseSettings):
     pubsub_dead_letter_topic: str = "document-dead-letter"
 
     # Adobe Acrobat Services
-    # SECURITY NOTE (MEDIUM-3.15): adobe_client_secret should use pydantic.SecretStr.
-    # See admin_token note above.
     adobe_client_id: str = ""
-    adobe_client_secret: str = ""
+    adobe_client_secret: SecretStr = SecretStr("")
 
     # Vertex AI
     vertex_ai_model: str = "gemini-2.5-pro"
@@ -75,13 +73,8 @@ class Settings(BaseSettings):
     postgres_url: str = ""            # e.g. "postgresql://user:pass@host:5432/dbname"
 
     # Auth tokens (POC — seeded via env vars)
-    # SECURITY NOTE (MEDIUM-3.15): These fields should use pydantic.SecretStr to
-    # prevent accidental logging via repr/str. Upgrading requires all callers
-    # (auth.py, axessense_client.py, adobe_client.py, etc.) to call
-    # .get_secret_value() instead of reading the field directly.
-    # Deferred to avoid breaking callers during this audit cycle.
-    admin_token: str = ""
-    reviewer_token: str = ""
+    admin_token: SecretStr = SecretStr("")
+    reviewer_token: SecretStr = SecretStr("")
 
     # OCR routing thresholds
     ocr_min_chars_threshold: int = 20
@@ -134,7 +127,7 @@ class Settings(BaseSettings):
                 "WCAG_ADOBE_CLIENT_ID is empty — Adobe API calls will fail.",
                 stacklevel=2,
             )
-        if not self.admin_token:
+        if not self.admin_token.get_secret_value():
             warnings.warn(
                 "WCAG_ADMIN_TOKEN is empty — admin auth will be unavailable.",
                 stacklevel=2,

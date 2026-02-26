@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from services.common.config import settings
@@ -87,9 +87,10 @@ async def get_document_review_items(document_id: str) -> list[dict]:
 @router.post(
     "/review-items/batch-approve",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     summary="Batch-approve multiple SIMPLE-flagged review items",
 )
-async def batch_approve_items(body: BatchApproveRequest) -> None:
+async def batch_approve_items(body: BatchApproveRequest) -> Response:
     """Approve all listed review items in a single request.
 
     Designed for SIMPLE-complexity items where the AI suggestion can be
@@ -119,6 +120,7 @@ async def batch_approve_items(body: BatchApproveRequest) -> None:
         len(body.item_ids),
         body.reviewed_by,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +131,13 @@ async def batch_approve_items(body: BatchApproveRequest) -> None:
 @router.post(
     "/review-items/{item_id}/decision",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     summary="Submit a reviewer decision for a single review item",
 )
 async def submit_review_decision(
     item_id: str,
     body: ReviewDecisionRequest,
-) -> None:
+) -> Response:
     """Record a reviewer's approve / edit / reject decision.
 
     - **approve**: accept the AI suggestion as-is.
@@ -164,3 +167,4 @@ async def submit_review_decision(
         item_id,
         body.reviewed_by,
     )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

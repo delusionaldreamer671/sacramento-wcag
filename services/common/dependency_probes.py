@@ -64,7 +64,7 @@ class AdobeCredentialsProbe(DependencyProbe):
         start = time.monotonic()
         from services.common.config import settings
         has_id = bool(settings.adobe_client_id)
-        has_secret = bool(settings.adobe_client_secret)
+        has_secret = bool(settings.adobe_client_secret.get_secret_value())
         elapsed = (time.monotonic() - start) * 1000
 
         if has_id and has_secret:

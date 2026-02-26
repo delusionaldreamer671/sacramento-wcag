@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
 
@@ -300,6 +300,7 @@ def run_extraction_pipeline(document_id: str, gcs_input_path: str) -> None:
 @app.post(
     "/api/extract",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
     summary="Receive Pub/Sub push message and run extraction pipeline",
     description=(
         "Called by Cloud Pub/Sub push subscription. Parses the message envelope, "
@@ -308,7 +309,7 @@ def run_extraction_pipeline(document_id: str, gcs_input_path: str) -> None:
         "5xx on transient failure (NACK — allow retry)."
     ),
 )
-async def receive_pubsub_push(request: Request) -> None:
+async def receive_pubsub_push(request: Request) -> Response:
     # Parse raw body — Pub/Sub push may not set Content-Type to application/json
     try:
         body = await request.json()
@@ -378,6 +379,8 @@ async def receive_pubsub_push(request: Request) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Extraction pipeline error: {exc}",
         ) from exc
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get(

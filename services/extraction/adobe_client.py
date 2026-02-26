@@ -247,7 +247,7 @@ class AdobeExtractClient:
         client_secret: str | None = None,
     ) -> None:
         self._client_id = client_id or settings.adobe_client_id
-        self._client_secret = client_secret or settings.adobe_client_secret
+        self._client_secret = client_secret or settings.adobe_client_secret.get_secret_value()
         self._max_retries = settings.max_retries
         self._backoff_base = settings.retry_backoff_base
 

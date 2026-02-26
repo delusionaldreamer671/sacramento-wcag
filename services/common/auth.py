@@ -342,8 +342,8 @@ async def require_auth(authorization: Optional[str] = Header(None)) -> None:
     """
     from services.common.config import settings  # imported here to avoid circular deps
 
-    admin_tok = settings.admin_token
-    reviewer_tok = settings.reviewer_token
+    admin_tok = settings.admin_token.get_secret_value()
+    reviewer_tok = settings.reviewer_token.get_secret_value()
 
     # Bypass: no tokens configured — allow all (local dev mode)
     if not admin_tok and not reviewer_tok:
@@ -500,10 +500,13 @@ def seed_default_users() -> None:
     """
     from services.common.config import settings  # imported here to avoid circular deps
 
-    if settings.admin_token:
+    admin_raw = settings.admin_token.get_secret_value()
+    reviewer_raw = settings.reviewer_token.get_secret_value()
+
+    if admin_raw:
         _seed_user_to_db_and_cache(
             user_id="admin",
-            raw_token=settings.admin_token,
+            raw_token=admin_raw,
             role="admin",
         )
     else:
@@ -511,10 +514,10 @@ def seed_default_users() -> None:
             "WCAG_ADMIN_TOKEN is not set — admin role will not be available."
         )
 
-    if settings.reviewer_token:
+    if reviewer_raw:
         _seed_user_to_db_and_cache(
             user_id="reviewer",
-            raw_token=settings.reviewer_token,
+            raw_token=reviewer_raw,
             role="reviewer",
         )
     else:

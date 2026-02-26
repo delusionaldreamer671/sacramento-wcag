@@ -831,7 +831,7 @@ def _try_auto_tag_path(
         return None
 
     # Check credentials
-    if not settings.adobe_client_id or not settings.adobe_client_secret:
+    if not settings.adobe_client_id or not settings.adobe_client_secret.get_secret_value():
         logger.debug("Adobe credentials not configured — skipping Auto-Tag path")
         return None
 

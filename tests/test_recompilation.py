@@ -245,6 +245,87 @@ def test_generate_pdfua_with_empty_html_returns_pdf_magic_bytes(builder: PDFUABu
 
 
 # ---------------------------------------------------------------------------
+# PDF/UA tagging — /MarkInfo, /Lang, XMP metadata
+# ---------------------------------------------------------------------------
+
+
+def test_generate_pdfua_contains_mark_info(populated_builder: PDFUABuilder):
+    """The PDF output must contain /MarkInfo << /Marked true >> (ISO 14289-1 §7.1)."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes = populated_builder.generate_pdfua(html)
+    assert b"/MarkInfo" in pdf_bytes
+    assert b"Marked" in pdf_bytes
+    # PDF boolean 'true' (not Python True) must appear
+    assert b"true" in pdf_bytes
+
+
+def test_generate_pdfua_contains_lang_entry(populated_builder: PDFUABuilder):
+    """/Lang must appear in the PDF catalog (ISO 14289-1 §7.2)."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes = populated_builder.generate_pdfua(html)
+    assert b"/Lang" in pdf_bytes
+
+
+def test_generate_pdfua_lang_matches_document_language():
+    """The /Lang value in the PDF must reflect the language set on the builder."""
+    b = PDFUABuilder(document_id="lang-test", document_title="Lang Test", language="fr")
+    b.add_element("paragraph", "Bonjour.")
+    html = b.build_semantic_html()
+    pdf_bytes = b.generate_pdfua(html)
+    # BCP-47 form: "fr-FR"
+    assert b"fr-FR" in pdf_bytes or b"fr" in pdf_bytes
+
+
+def test_generate_pdfua_contains_xmp_metadata(populated_builder: PDFUABuilder):
+    """The PDF output must contain an XMP metadata stream."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes = populated_builder.generate_pdfua(html)
+    assert b"/Metadata" in pdf_bytes
+    assert b"xpacket" in pdf_bytes
+
+
+def test_generate_pdfua_xmp_contains_pdfua_marker(populated_builder: PDFUABuilder):
+    """The XMP metadata must include the pdfuaid:part=1 PDF/UA-1 identifier."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes = populated_builder.generate_pdfua(html)
+    assert b"pdfuaid" in pdf_bytes
+    assert b"<pdfuaid:part>1</pdfuaid:part>" in pdf_bytes
+
+
+def test_generate_pdfua_xmp_contains_dc_title(populated_builder: PDFUABuilder):
+    """The XMP metadata must include a dc:title element."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes = populated_builder.generate_pdfua(html)
+    assert b"dc:title" in pdf_bytes
+
+
+def test_generate_pdfua_placeholder_contains_mark_info(builder: PDFUABuilder):
+    """Even the minimal placeholder PDF (empty HTML) must set /MarkInfo."""
+    pdf_bytes = builder.generate_pdfua("")
+    assert b"Marked" in pdf_bytes
+
+
+def test_generate_pdfua_placeholder_contains_lang(builder: PDFUABuilder):
+    """Even the minimal placeholder PDF (empty HTML) must set /Lang."""
+    pdf_bytes = builder.generate_pdfua("")
+    assert b"/Lang" in pdf_bytes
+
+
+def test_generate_pdfua_placeholder_contains_xmp(builder: PDFUABuilder):
+    """Even the minimal placeholder PDF (empty HTML) must contain XMP metadata."""
+    pdf_bytes = builder.generate_pdfua("")
+    assert b"pdfuaid" in pdf_bytes
+
+
+def test_generate_pdfua_output_is_deterministic(populated_builder: PDFUABuilder):
+    """Two calls with the same input must produce identical byte output (invariant mode)."""
+    html = populated_builder.build_semantic_html()
+    pdf_bytes_1 = populated_builder.generate_pdfua(html)
+    pdf_bytes_2 = populated_builder.generate_pdfua(html)
+    assert pdf_bytes_1 == pdf_bytes_2
+
+
+# ---------------------------------------------------------------------------
 # validate_accessibility
 # ---------------------------------------------------------------------------
 

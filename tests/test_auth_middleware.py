@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 from fastapi import FastAPI, Depends
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 
 # ---------------------------------------------------------------------------
@@ -44,8 +45,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = ""
-            mock_settings.reviewer_token = ""
+            mock_settings.admin_token = SecretStr("")
+            mock_settings.reviewer_token = SecretStr("")
             # Should not raise
             result = self._run(require_auth(authorization=None))
             assert result is None  # returns None on success
@@ -55,8 +56,8 @@ class TestRequireAuthUnit:
         from services.common.auth import require_auth
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = ""
-            mock_settings.reviewer_token = ""
+            mock_settings.admin_token = SecretStr("")
+            mock_settings.reviewer_token = SecretStr("")
             # Even a completely wrong header is fine in bypass mode
             result = self._run(require_auth(authorization="garbage-value"))
             assert result is None
@@ -68,8 +69,8 @@ class TestRequireAuthUnit:
         from services.common.auth import require_auth
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "secret-admin-token"
-            mock_settings.reviewer_token = "secret-reviewer-token"
+            mock_settings.admin_token = SecretStr("secret-admin-token")
+            mock_settings.reviewer_token = SecretStr("secret-reviewer-token")
             # Should not raise
             result = self._run(require_auth(authorization="Bearer secret-admin-token"))
             assert result is None
@@ -79,8 +80,8 @@ class TestRequireAuthUnit:
         from services.common.auth import require_auth
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "secret-admin-token"
-            mock_settings.reviewer_token = "secret-reviewer-token"
+            mock_settings.admin_token = SecretStr("secret-admin-token")
+            mock_settings.reviewer_token = SecretStr("secret-reviewer-token")
             result = self._run(require_auth(authorization="Bearer secret-reviewer-token"))
             assert result is None
 
@@ -90,8 +91,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "only-admin"
-            mock_settings.reviewer_token = ""
+            mock_settings.admin_token = SecretStr("only-admin")
+            mock_settings.reviewer_token = SecretStr("")
             # Admin token works
             result = self._run(require_auth(authorization="Bearer only-admin"))
             assert result is None
@@ -107,8 +108,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = ""
-            mock_settings.reviewer_token = "only-reviewer"
+            mock_settings.admin_token = SecretStr("")
+            mock_settings.reviewer_token = SecretStr("only-reviewer")
             # Reviewer token works — but not bypass mode because reviewer_token is set
             result = self._run(require_auth(authorization="Bearer only-reviewer"))
             assert result is None
@@ -126,8 +127,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "admin-tok"
-            mock_settings.reviewer_token = "reviewer-tok"
+            mock_settings.admin_token = SecretStr("admin-tok")
+            mock_settings.reviewer_token = SecretStr("reviewer-tok")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization=None))
             assert exc_info.value.status_code == 401
@@ -140,8 +141,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "admin-tok"
-            mock_settings.reviewer_token = "reviewer-tok"
+            mock_settings.admin_token = SecretStr("admin-tok")
+            mock_settings.reviewer_token = SecretStr("reviewer-tok")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization=None))
             assert "Authentication required" in exc_info.value.detail
@@ -152,8 +153,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "admin-tok"
-            mock_settings.reviewer_token = "reviewer-tok"
+            mock_settings.admin_token = SecretStr("admin-tok")
+            mock_settings.reviewer_token = SecretStr("reviewer-tok")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization="Basic dXNlcjpwYXNz"))
             assert exc_info.value.status_code == 401
@@ -164,8 +165,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "admin-tok"
-            mock_settings.reviewer_token = "reviewer-tok"
+            mock_settings.admin_token = SecretStr("admin-tok")
+            mock_settings.reviewer_token = SecretStr("reviewer-tok")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization="Bearer "))
             assert exc_info.value.status_code == 401
@@ -176,8 +177,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "correct-admin"
-            mock_settings.reviewer_token = "correct-reviewer"
+            mock_settings.admin_token = SecretStr("correct-admin")
+            mock_settings.reviewer_token = SecretStr("correct-reviewer")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization="Bearer totally-wrong-token"))
             assert exc_info.value.status_code == 401
@@ -189,8 +190,8 @@ class TestRequireAuthUnit:
         from fastapi import HTTPException
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "correct-admin"
-            mock_settings.reviewer_token = "correct-reviewer"
+            mock_settings.admin_token = SecretStr("correct-admin")
+            mock_settings.reviewer_token = SecretStr("correct-reviewer")
             with pytest.raises(HTTPException) as exc_info:
                 self._run(require_auth(authorization="Bearer wrong"))
             assert "denied" in exc_info.value.detail.lower() or "invalid" in exc_info.value.detail.lower()
@@ -200,8 +201,8 @@ class TestRequireAuthUnit:
         from services.common.auth import require_auth
 
         with patch("services.common.config.settings") as mock_settings:
-            mock_settings.admin_token = "my-admin-token"
-            mock_settings.reviewer_token = ""
+            mock_settings.admin_token = SecretStr("my-admin-token")
+            mock_settings.reviewer_token = SecretStr("")
             result = self._run(require_auth(authorization="bearer my-admin-token"))
             assert result is None
 
@@ -245,8 +246,8 @@ def auth_client():
 
     with patch("services.common.database.get_db", return_value=test_db), \
          patch("services.ingestion.router.get_db", return_value=test_db), \
-         patch.object(real_settings, "admin_token", admin_token), \
-         patch.object(real_settings, "reviewer_token", reviewer_token):
+         patch.object(real_settings, "admin_token", SecretStr(admin_token)), \
+         patch.object(real_settings, "reviewer_token", SecretStr(reviewer_token)):
 
         from services.ingestion.main import app
         client = TestClient(app, raise_server_exceptions=False)
@@ -265,8 +266,8 @@ def noauth_client():
 
     with patch("services.common.database.get_db", return_value=test_db), \
          patch("services.ingestion.router.get_db", return_value=test_db), \
-         patch.object(real_settings, "admin_token", ""), \
-         patch.object(real_settings, "reviewer_token", ""):
+         patch.object(real_settings, "admin_token", SecretStr("")), \
+         patch.object(real_settings, "reviewer_token", SecretStr("")):
 
         from services.ingestion.main import app
         yield TestClient(app, raise_server_exceptions=False)
