@@ -184,14 +184,18 @@ def test_build_table_structure_prompt_system_is_constant_prompt():
     assert system == TABLE_STRUCTURE_SYSTEM_PROMPT
 
 
-def test_build_table_structure_prompt_includes_scope_instructions():
-    """The system instruction must reference scope= attributes required by WCAG 1.3.1."""
+def test_build_table_structure_prompt_requests_json_output():
+    """The system instruction must request JSON output (not HTML) for table analysis."""
     system, _ = build_table_structure_prompt(
         raw_table_data="[]",
         column_headers="[]",
         row_headers="[]",
     )
-    assert "scope" in system.lower()
+    assert "JSON" in system
+    assert "header_row_count" in system
+    assert "header_col_count" in system
+    assert "suggested_caption" in system
+    assert "has_merged_cells" in system
 
 
 def test_build_table_structure_prompt_references_wcag_criterion():
@@ -412,7 +416,7 @@ def test_generate_alt_text_returns_fallback_when_credentials_missing(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
 
     result = vertex_client.generate_alt_text_for_image(
@@ -432,7 +436,7 @@ def test_generate_alt_text_returns_fallback_when_image_base64_empty(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     result = vertex_client.generate_alt_text_for_image(
@@ -453,7 +457,7 @@ def test_generate_alt_text_returns_fallback_when_vertex_raises(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     # Make the SDK appear available so we get past Gate 0
@@ -530,7 +534,7 @@ def test_generate_alt_text_returns_empty_string_for_decorative_classification(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     # Gemini returns the two-character decorative marker (quoted)
@@ -558,7 +562,7 @@ def test_generate_alt_text_returns_generated_text_on_success(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     expected_alt = "Bar chart showing annual budget allocation by department, 2020-2024."
@@ -586,7 +590,7 @@ def test_generate_alt_text_truncates_runaway_response(
     from services.ai_drafting import vertex_client
     from services.common.config import settings
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     # Generate a 1500-char response
@@ -613,9 +617,10 @@ def test_generate_alt_text_truncates_runaway_response(
 def test_stage_ai_alt_text_skips_when_vertex_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """stage_ai_alt_text returns the ir_doc unchanged when Vertex AI is not configured."""
+    """stage_ai_alt_text raises StageNoOpError when Vertex AI is not configured."""
     from services.common.config import settings
     from services.common.ir import BlockSource, BlockType, IRBlock, IRDocument, IRPage, RemediationStatus
+    from services.common.pipeline import StageNoOpError
     from services.ingestion.converter import stage_ai_alt_text
 
     monkeypatch.setattr(settings, "vertex_ai_model", "")
@@ -638,11 +643,16 @@ def test_stage_ai_alt_text_skips_when_vertex_not_configured(
         pages=[IRPage(page_num=0, blocks=[block])],
     )
 
-    result = stage_ai_alt_text(ir_doc)
+    # Now raises StageNoOpError instead of silently returning —
+    # run_stage catches this and marks the stage as "degraded"
+    with pytest.raises(StageNoOpError) as exc_info:
+        stage_ai_alt_text(ir_doc)
 
+    # The ir_doc is attached to the exception so run_stage can extract it
+    assert exc_info.value.data is ir_doc  # type: ignore[attr-defined]
     # The alt text must be unchanged — Vertex AI was not called
-    assert result.all_blocks()[0].attributes["alt"] == "[Figure on page 1 — alt text requires review]"
-    assert result.all_blocks()[0].remediation_status == RemediationStatus.RAW
+    assert ir_doc.all_blocks()[0].attributes["alt"] == "[Figure on page 1 — alt text requires review]"
+    assert ir_doc.all_blocks()[0].remediation_status == RemediationStatus.RAW
 
 
 def test_stage_ai_alt_text_skips_images_with_real_alt_text(
@@ -654,7 +664,7 @@ def test_stage_ai_alt_text_skips_images_with_real_alt_text(
     from services.common.ir import BlockSource, BlockType, IRBlock, IRDocument, IRPage, RemediationStatus
     from services.ingestion import converter
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     # Patch the generate function so we can detect if it was called
@@ -684,12 +694,13 @@ def test_stage_ai_alt_text_skips_images_with_real_alt_text(
 
     from services.ingestion.converter import stage_ai_alt_text
 
-    result = stage_ai_alt_text(ir_doc)
+    result, metrics = stage_ai_alt_text(ir_doc)
 
     # Alt text must remain unchanged
     assert result.all_blocks()[0].attributes["alt"] == "Sacramento County seal"
     # The generate function should NOT have been called
     mock_generate.assert_not_called()
+    assert metrics["ai_attempted"] == 0
 
 
 def test_stage_ai_alt_text_skips_images_without_src(
@@ -701,7 +712,7 @@ def test_stage_ai_alt_text_skips_images_without_src(
     from services.common.ir import BlockSource, BlockType, IRBlock, IRDocument, IRPage, RemediationStatus
     from services.ingestion import converter
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
 
     mock_generate = MagicMock(return_value="should not be used")
@@ -725,29 +736,31 @@ def test_stage_ai_alt_text_skips_images_without_src(
 
     from services.ingestion.converter import stage_ai_alt_text
 
-    result = stage_ai_alt_text(ir_doc)
+    result, metrics = stage_ai_alt_text(ir_doc)
 
     # Alt text must remain unchanged since there is no image data
     assert result.all_blocks()[0].attributes["alt"] == "[Figure on page 2 — alt text requires review]"
+    assert metrics["skipped_no_src"] >= 1
 
 
-def test_stage_ai_alt_text_respects_image_limit(
+def test_stage_ai_alt_text_processes_all_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the first _AI_ALT_TEXT_IMAGE_LIMIT images must be processed; the rest keep placeholders."""
+    """All eligible images must be processed — there is no per-document cap."""
     import base64
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
     from services.common.config import settings
     from services.common.ir import BlockSource, BlockType, IRBlock, IRDocument, IRPage, RemediationStatus
     from services.ingestion import converter
 
-    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-1.5-pro-002")
+    monkeypatch.setattr(settings, "vertex_ai_model", "gemini-2.5-pro")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/creds.json")
     monkeypatch.setattr(converter, "_vertex_ai_available", lambda: True)
-    monkeypatch.setattr(converter, "_AI_ALT_TEXT_IMAGE_LIMIT", 3)
+
+    # Patch time.sleep so batch rate-limit delays don't slow down the test
+    monkeypatch.setattr(converter.time, "sleep", lambda _: None)
 
     generated_alt = "Generated alt text for image."
-
     call_count = 0
 
     def _fake_generate(image_base64, image_mime, surrounding_text, page_num, fallback_alt):
@@ -758,6 +771,8 @@ def test_stage_ai_alt_text_respects_image_limit(
     tiny_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20).decode()
     placeholder = "[Figure on page 1 — alt text requires review]"
 
+    # Use more images than the old cap of 20 to verify unlimited processing
+    num_images = 7
     blocks = [
         IRBlock(
             block_type=BlockType.IMAGE,
@@ -765,11 +780,11 @@ def test_stage_ai_alt_text_respects_image_limit(
             remediation_status=RemediationStatus.RAW,
             attributes={"alt": placeholder, "src": f"data:image/png;base64,{tiny_b64}"},
         )
-        for _ in range(5)  # 5 images, limit is 3
+        for _ in range(num_images)
     ]
 
     ir_doc = IRDocument(
-        document_id="test-limit",
+        document_id="test-unlimited",
         filename="test.pdf",
         page_count=1,
         pages=[IRPage(page_num=0, blocks=blocks)],
@@ -782,20 +797,17 @@ def test_stage_ai_alt_text_respects_image_limit(
         side_effect=_fake_generate,
     ):
         from services.ingestion.converter import stage_ai_alt_text
-        result = stage_ai_alt_text(ir_doc)
+        result, metrics = stage_ai_alt_text(ir_doc)
 
     all_blocks = result.all_blocks()
-    # First 3 blocks should have AI-generated alt text
-    for i in range(3):
+    # ALL blocks should have AI-generated alt text — no cap
+    for i in range(num_images):
         assert all_blocks[i].attributes["alt"] == generated_alt, (
-            f"Block {i} should have AI alt text"
+            f"Block {i} should have AI alt text (no cap)"
         )
-    # Last 2 blocks should still have the placeholder
-    for i in range(3, 5):
-        assert all_blocks[i].attributes["alt"] == placeholder, (
-            f"Block {i} should still have placeholder alt text"
-        )
-    assert call_count == 3
+    assert call_count == num_images, (
+        f"Expected {num_images} Gemini calls (all images), got {call_count}"
+    )
 
 
 def test_get_surrounding_text_collects_adjacent_paragraphs() -> None:

@@ -77,7 +77,16 @@ def init_telemetry(app: FastAPI) -> None:
                 _tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
                 logger.info("OTLP exporter configured: endpoint=%s", _OTLP_ENDPOINT)
             except Exception as exc:
-                logger.warning("OTLP exporter failed (%s), falling back to console", exc)
+                # MEDIUM-2.18: Warn explicitly that OTLP tracing is degraded.
+                # Without this warning, operators would not know that traces are
+                # NOT being forwarded to Jaeger/the collector despite OTEL_EXPORTER=otlp.
+                logger.warning(
+                    "OTLP exporter failed to initialise (endpoint=%s, error=%s). "
+                    "Tracing is DEGRADED — spans will be written to console only, "
+                    "not forwarded to the OTLP collector. "
+                    "Fix the endpoint or check collector availability.",
+                    _OTLP_ENDPOINT, exc,
+                )
                 _tracer_provider.add_span_processor(
                     SimpleSpanProcessor(ConsoleSpanExporter())
                 )

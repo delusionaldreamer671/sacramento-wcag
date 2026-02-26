@@ -48,11 +48,23 @@ const STATUS_COLORS: Record<DocumentStatus, string> = {
   failed: "bg-red-100 text-red-800 border-red-200",
 };
 
-/** Pending review count is derived from document status for the MVP — in production
- *  this would be a separate count field from the API. */
+/**
+ * Pending review count is derived from document status for the MVP — in
+ * production this should be replaced with an actual count returned by the API
+ * (e.g. a `pending_review_count` field on DocumentStatusResponse).
+ *
+ * The heuristic below (1 review item per 5 pages, minimum 1) is intentionally
+ * crude: it serves only to populate the "Pending Reviews" column with a
+ * non-zero indicator when a document is in the hitl_review state, so reviewers
+ * know work is waiting.  It does NOT reflect the true number of HITLReviewItem
+ * records for that document.
+ *
+ * TODO: Replace with actual review item count from the API once the list
+ * endpoint includes per-document pending_review_count.
+ */
 function getPendingReviewCount(doc: PDFDocument): number {
   if (doc.status !== "hitl_review") return 0;
-  // Placeholder heuristic until API returns per-document pending counts
+  // Heuristic: ~1 review item per 5 pages — replace with real API count.
   return doc.page_count > 0 ? Math.max(1, Math.floor(doc.page_count / 5)) : 1;
 }
 

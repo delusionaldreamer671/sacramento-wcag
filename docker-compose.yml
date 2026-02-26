@@ -2,7 +2,7 @@
 # Usage: docker compose up verapdf
 services:
   verapdf:
-    image: verapdf/rest:latest
+    image: verapdf/rest:latest  # TODO: Pin to specific version (e.g., verapdf/rest:<version>)
     ports:
       - "8080:8080"
     healthcheck:

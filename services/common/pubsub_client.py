@@ -42,7 +42,8 @@ def publish_message(topic_name: str, data: dict[str, Any]) -> str:
     message_bytes = json.dumps(data).encode("utf-8")
 
     future = publisher.publish(topic, message_bytes)
-    message_id = future.result()
+    # HIGH-4.8: Add timeout to prevent indefinite hang on publish
+    message_id = future.result(timeout=30)
     logger.info("Published message %s to %s", message_id, topic_name)
     return message_id
 
@@ -75,6 +76,11 @@ def subscribe(
             logger.info(
                 "Received message %s on %s", message.message_id, subscription_name
             )
+            # MEDIUM-4.16: ack() is called AFTER callback() returns so any
+            # exception raised by the caller (including durable write failures)
+            # triggers nack() and causes redelivery. Callers MUST raise on
+            # durable write failure — returning normally signals success and
+            # will cause the message to be acknowledged.
             callback(payload)
             message.ack()
         except Exception:
@@ -98,11 +104,42 @@ def subscribe(
 def parse_pubsub_push(body: dict[str, Any]) -> dict[str, Any]:
     """Parse a Pub/Sub push message body (for Cloud Run HTTP endpoints).
 
-    Cloud Run receives Pub/Sub messages as HTTP POST with a specific envelope format.
+    Cloud Run receives Pub/Sub messages as HTTP POST with a specific envelope format:
+    {"message": {"data": "<base64-encoded JSON>", "messageId": "...", ...}}
+
+    Raises:
+        ValueError: if the envelope is malformed (missing "message" key, missing
+                    "data" field, invalid base64, or non-JSON payload). Callers
+                    should map this to HTTP 400 so Pub/Sub does not retry.
     """
     import base64
 
-    message = body.get("message", {})
-    data_b64 = message.get("data", "")
-    data_bytes = base64.b64decode(data_b64)
-    return json.loads(data_bytes)
+    # MEDIUM-4.23: Validate message structure before processing — raise ValueError
+    # for malformed messages so callers can return HTTP 400 (no retry) instead of
+    # crashing with an unhandled exception that maps to HTTP 500 (triggers retry).
+    if not isinstance(body, dict):
+        raise ValueError(f"Pub/Sub push body must be a JSON object, got {type(body).__name__}")
+
+    message = body.get("message")
+    if message is None:
+        raise ValueError("Pub/Sub push envelope missing required 'message' key")
+    if not isinstance(message, dict):
+        raise ValueError(
+            f"Pub/Sub push 'message' must be a JSON object, got {type(message).__name__}"
+        )
+
+    data_b64 = message.get("data")
+    if not data_b64:
+        raise ValueError("Pub/Sub push message missing required 'data' field")
+
+    try:
+        data_bytes = base64.b64decode(data_b64)
+    except Exception as exc:
+        raise ValueError(f"Pub/Sub push 'data' field is not valid base64: {exc}") from exc
+
+    try:
+        return json.loads(data_bytes)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Pub/Sub push message payload is not valid JSON after base64 decode: {exc}"
+        ) from exc

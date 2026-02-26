@@ -90,11 +90,15 @@ def profile_page(pdf_bytes: bytes, page_num: int) -> PageProfile:
         )
 
     except Exception as exc:
-        logger.warning("Failed to profile page %d: %s", page_num, exc)
+        logger.warning(
+            "Failed to profile page %d: %s — defaulting has_extractable_text=False "
+            "(scanned PDF guard: route to OCR rather than silently pass)",
+            page_num, exc,
+        )
         return PageProfile(
             page_num=page_num,
-            has_extractable_text=True,
-            route="adobe",
+            has_extractable_text=False,
+            route="ocr",
         )
 
 
@@ -107,7 +111,12 @@ def profile_document(pdf_bytes: bytes, filename: str) -> DocumentProfile:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         page_count = len(reader.pages)
     except Exception as exc:
-        logger.warning("Failed to read PDF for profiling: %s", exc)
+        logger.warning(
+            "Failed to read PDF '%s' for profiling: %s — returning error status "
+            "(page_count=0, overall_route='all_adobe' is a fallback; "
+            "caller should treat this as a processing error)",
+            filename, exc,
+        )
         return DocumentProfile(
             filename=filename,
             page_count=0,

@@ -150,16 +150,17 @@ def enhance_tagged_pdf(
             collector.record(RemediationComponent.MARK_INFO, after="Marked=true")
 
         # 3. Inject alt text into /Figure structure elements
-        alt_texts = _collect_alt_texts(ir_doc)
-        alt_changes = _inject_alt_text(pdf, alt_texts)
+        alt_data = _collect_alt_texts(ir_doc)
+        alt_changes = _inject_alt_text(pdf, alt_data)
         changes += alt_changes
-        if collector and alt_texts:
+        if collector and alt_data:
             from services.common.remediation_events import RemediationComponent  # noqa: PLC0415
-            for i, alt in enumerate(alt_texts):
+            for i, entry in enumerate(alt_data):
+                alt = entry["alt"]
                 if alt:
                     collector.record(
                         RemediationComponent.ALT_TEXT,
-                        element_id=f"figure-{i}",
+                        element_id=entry.get("image_id") or f"figure-{i}",
                         before=None,
                         after=alt,
                         source="pipeline",
@@ -197,7 +198,18 @@ def enhance_tagged_pdf(
         return enhanced_bytes
 
     except Exception as exc:
-        logger.error("enhance_tagged_pdf: error during enhancement: %s", exc)
+        logger.warning(
+            "enhance_tagged_pdf: enhancement failed for '%s': %s — "
+            "returning ORIGINAL unenhanced bytes. Downstream PDF will lack "
+            "AI-injected alt text, bookmarks, and /Lang corrections. "
+            "[enhancement_failed=true]",
+            ir_doc.filename, exc,
+        )
+        if collector is not None:
+            try:
+                collector.set_flag("enhancement_failed", True)
+            except Exception:
+                pass
         try:
             pdf.close()
         except Exception:
@@ -337,33 +349,48 @@ def _ensure_mark_info(pdf: "pikepdf.Pdf") -> int:
 # ---------------------------------------------------------------------------
 
 
-def _collect_alt_texts(ir_doc: IRDocument) -> list[str]:
-    """Collect alt text strings from IMAGE blocks in document order.
+def _collect_alt_texts(ir_doc: IRDocument) -> list[dict]:
+    """Collect alt text data from IMAGE blocks in document order.
 
-    Returns a list of alt text strings in the order images appear in the IR.
-    Empty strings for images without alt text (decorative).
+    Returns a list of dicts with keys:
+      - alt (str): the alt text
+      - page_num (int): 0-based page number
+      - bbox (tuple | None): (x1, y1, x2, y2) bounding box if non-zero
+      - image_id (str): image ID for logging (uses block_id as fallback)
     """
-    alt_texts: list[str] = []
+    alt_data: list[dict] = []
     for block in ir_doc.all_blocks():
         if block.block_type == BlockType.IMAGE:
             alt = block.attributes.get("alt", "")
-            alt_texts.append(alt)
-    return alt_texts
+            bbox = None
+            if block.bbox and (
+                block.bbox.x1 or block.bbox.y1 or block.bbox.x2 or block.bbox.y2
+            ):
+                bbox = (block.bbox.x1, block.bbox.y1, block.bbox.x2, block.bbox.y2)
+            alt_data.append({
+                "alt": alt,
+                "page_num": block.page_num,
+                "bbox": bbox,
+                "image_id": block.attributes.get("image_id", "") or block.block_id,
+            })
+    return alt_data
 
 
 def _inject_alt_text(
     pdf: "pikepdf.Pdf",
-    alt_texts: list[str],
+    alt_data: list[dict],
 ) -> int:
     """Walk the PDF structure tree and inject /Alt on /Figure elements.
 
-    Matches figures in document order: the Nth /Figure in the structure tree
-    gets the Nth alt text from our IR. This relies on Adobe Auto-Tag producing
-    figures in the same reading order as our extraction pipeline.
+    Uses page-based matching instead of ordinal position to correctly
+    associate IR image alt text with PDF /Figure structure elements,
+    even when Auto-Tag serializes figures in a different order than
+    the extraction pipeline.
 
     Args:
         pdf: An open pikepdf.Pdf object.
-        alt_texts: Alt text strings in document order (from _collect_alt_texts).
+        alt_data: Alt text data from _collect_alt_texts() — list of dicts
+            with keys: alt, page_num, bbox, image_id.
 
     Returns:
         Number of alt text values injected.
@@ -383,30 +410,127 @@ def _inject_alt_text(
         logger.debug("_inject_alt_text: no /Figure elements found in structure tree")
         return 0
 
+    # Build page index: map page object id → 0-based page number
+    page_index: dict[int, int] = {}
+    for page_num, page_obj in enumerate(pdf.pages):
+        page_index[id(page_obj.obj)] = page_num
+
+    def _get_figure_page(figure_elem: "pikepdf.Dictionary") -> "int | None":
+        """Extract the page number for a /Figure structure element."""
+        # Check direct /Pg reference first
+        pg = figure_elem.get("/Pg")
+        if pg is not None:
+            try:
+                pg_id = id(pg.obj) if hasattr(pg, "obj") else id(pg)
+                if pg_id in page_index:
+                    return page_index[pg_id]
+                # Try resolving by equality against page objects
+                for pnum, pobj in enumerate(pdf.pages):
+                    if pg == pobj.obj:
+                        return pnum
+            except Exception:
+                pass
+
+        # Check /K (kids) for /Pg reference
+        kids = figure_elem.get("/K")
+        if kids is not None:
+            if isinstance(kids, pikepdf.Dictionary):
+                pg = kids.get("/Pg")
+                if pg is not None:
+                    try:
+                        for pnum, pobj in enumerate(pdf.pages):
+                            if pg == pobj.obj:
+                                return pnum
+                    except Exception:
+                        pass
+            elif isinstance(kids, pikepdf.Array):
+                for kid in kids:
+                    if isinstance(kid, pikepdf.Dictionary):
+                        pg = kid.get("/Pg")
+                        if pg is not None:
+                            try:
+                                for pnum, pobj in enumerate(pdf.pages):
+                                    if pg == pobj.obj:
+                                        return pnum
+                            except Exception:
+                                pass
+        return None
+
+    # Group IR alt data by page for efficient lookup
+    alt_by_page: dict[int, list[dict]] = {}
+    for entry in alt_data:
+        pg = entry["page_num"]
+        if pg not in alt_by_page:
+            alt_by_page[pg] = []
+        alt_by_page[pg].append(entry)
+
+    # Track which IR entries have been consumed (to avoid double-assignment)
+    consumed: set[int] = set()  # indices into alt_data
+
     injected = 0
-    for idx, figure_elem in enumerate(figures):
-        if idx >= len(alt_texts):
-            break
+    ordinal_fallback_count = 0
 
-        alt = alt_texts[idx]
-        if not alt:
-            continue
-
+    for fig_idx, figure_elem in enumerate(figures):
         # Only inject if /Alt is not already set or is empty
         existing_alt = figure_elem.get("/Alt")
         if existing_alt is not None and str(existing_alt).strip():
             logger.debug(
                 "_inject_alt_text: figure %d already has /Alt='%s' — skipping",
-                idx, str(existing_alt)[:50],
+                fig_idx, str(existing_alt)[:50],
             )
+            continue
+
+        fig_page = _get_figure_page(figure_elem)
+
+        matched_entry: "dict | None" = None
+        matched_idx: "int | None" = None
+
+        if fig_page is not None and fig_page in alt_by_page:
+            # Page-based matching: find the first unconsumed IR image on the same page
+            for entry in alt_by_page[fig_page]:
+                entry_idx = alt_data.index(entry)
+                if entry_idx not in consumed:
+                    matched_entry = entry
+                    matched_idx = entry_idx
+                    break
+
+        if matched_entry is None:
+            # Ordinal fallback: use the first unconsumed entry regardless of page
+            for i, entry in enumerate(alt_data):
+                if i not in consumed:
+                    matched_entry = entry
+                    matched_idx = i
+                    ordinal_fallback_count += 1
+                    break
+
+        if matched_entry is None or matched_idx is None:
+            break  # No more alt data available
+
+        consumed.add(matched_idx)
+
+        alt = matched_entry["alt"]
+        if not alt:
             continue
 
         figure_elem["/Alt"] = pikepdf.String(alt)
         injected += 1
 
+        logger.debug(
+            "_inject_alt_text: injected alt on figure %d (page=%s, image_id=%s, method=%s)",
+            fig_idx, fig_page, matched_entry.get("image_id", "?"),
+            "page_match" if fig_page is not None else "ordinal_fallback",
+        )
+
+    if ordinal_fallback_count:
+        logger.warning(
+            "_inject_alt_text: %d/%d figures used ordinal fallback (page info unavailable)",
+            ordinal_fallback_count, len(figures),
+        )
+
     logger.info(
-        "_inject_alt_text: injected alt text on %d/%d figures (%d in IR)",
-        injected, len(figures), len(alt_texts),
+        "_inject_alt_text: injected alt text on %d/%d figures (%d in IR, %d by page match, %d by ordinal)",
+        injected, len(figures), len(alt_data),
+        injected - ordinal_fallback_count, ordinal_fallback_count,
     )
     return injected
 
@@ -449,32 +573,30 @@ def _find_struct_elements(
 # ---------------------------------------------------------------------------
 
 
-def _collect_headings(ir_doc: IRDocument) -> list[tuple[int, str]]:
-    """Collect (level, text) tuples from HEADING blocks in document order."""
-    headings: list[tuple[int, str]] = []
+def _collect_headings(ir_doc: IRDocument) -> list[tuple[int, str, int]]:
+    """Collect (level, text, page_num) tuples from HEADING blocks in document order."""
+    headings: list[tuple[int, str, int]] = []
     for block in ir_doc.all_blocks():
         if block.block_type == BlockType.HEADING:
             level = block.attributes.get("level", 2)
             text = block.content.strip()
             if text:
-                headings.append((level, text))
+                headings.append((level, text, block.page_num))
     return headings
 
 
 def _generate_bookmarks(
     pdf: "pikepdf.Pdf",
-    headings: list[tuple[int, str]],
+    headings: list[tuple[int, str, int]],
 ) -> int:
     """Generate PDF outline (bookmarks) from IR heading structure.
 
-    Creates a flat outline with all headings as top-level entries pointing
-    to page 1 (since we don't have page-level mapping for individual headings
-    in the current IR). This is a POC approach — a production version would
-    match headings to specific pages via the structure tree.
+    Creates a nested outline respecting heading levels, with each bookmark
+    pointing to the actual page where the heading appears in the document.
 
     Args:
         pdf: An open pikepdf.Pdf object.
-        headings: List of (level, text) tuples from _collect_headings.
+        headings: List of (level, text, page_num) tuples from _collect_headings.
 
     Returns:
         Number of bookmarks created.
@@ -501,15 +623,15 @@ def _generate_bookmarks(
 
     # Build a nested bookmark structure respecting heading levels.
     # H1 → top-level, H2 → child of last H1, H3 → child of last H2, etc.
-    # For the POC, all bookmarks point to page 0 (first page).
-    # A production version would map headings to actual pages.
+    # Each bookmark points to the actual page where the heading appears.
 
     with pdf.open_outline() as outline:
         # Stack tracks (level, outline_item) for nesting
         stack: list[tuple[int, Any]] = []
 
-        for level, text in headings:
-            item = pikepdf.OutlineItem(text, 0)  # Page 0 destination
+        for level, text, page_num in headings:
+            dest_page = max(0, min(page_num, len(pdf.pages) - 1)) if pdf.pages else 0
+            item = pikepdf.OutlineItem(text, dest_page)
 
             if not stack:
                 outline.root.append(item)

@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     pubsub_dead_letter_topic: str = "document-dead-letter"
 
     # Adobe Acrobat Services
+    # SECURITY NOTE (MEDIUM-3.15): adobe_client_secret should use pydantic.SecretStr.
+    # See admin_token note above.
     adobe_client_id: str = ""
     adobe_client_secret: str = ""
 
@@ -73,6 +75,11 @@ class Settings(BaseSettings):
     postgres_url: str = ""            # e.g. "postgresql://user:pass@host:5432/dbname"
 
     # Auth tokens (POC — seeded via env vars)
+    # SECURITY NOTE (MEDIUM-3.15): These fields should use pydantic.SecretStr to
+    # prevent accidental logging via repr/str. Upgrading requires all callers
+    # (auth.py, axessense_client.py, adobe_client.py, etc.) to call
+    # .get_secret_value() instead of reading the field directly.
+    # Deferred to avoid breaking callers during this audit cycle.
     admin_token: str = ""
     reviewer_token: str = ""
 

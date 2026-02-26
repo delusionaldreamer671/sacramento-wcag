@@ -101,7 +101,7 @@ def _process_one(pdf_path: Path, output_dir: Path) -> dict:
     t0 = time.perf_counter()
     try:
         pdf_bytes = pdf_path.read_bytes()
-        html_bytes, _content_type = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
+        html_bytes, _content_type, _task_id = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
         elapsed = time.perf_counter() - t0
         result["elapsed_s"] = round(elapsed, 3)
     except Exception as exc:

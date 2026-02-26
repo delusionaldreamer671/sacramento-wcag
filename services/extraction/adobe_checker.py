@@ -13,7 +13,9 @@ Reference: https://developer.adobe.com/document-services/docs/overview/pdf-acces
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,30 @@ try:
     _SDK_AVAILABLE = True
 except ImportError:
     pass
+
+# HIGH-4.12: Check if the Accessibility Checker Job class is importable
+# at module load time and set a flag. This avoids repeated try/except
+# on every call and makes the checker's availability explicit.
+_CHECKER_AVAILABLE = False
+_PDFAccessibilityCheckerJob: Any = None
+_CheckerResultType: Any = None
+
+try:
+    from adobe.pdfservices.operation.pdfjobs.jobs.pdf_accessibility_checker_job import (
+        PDFAccessibilityCheckerJob as _ImportedCheckerJob,
+    )
+    _PDFAccessibilityCheckerJob = _ImportedCheckerJob
+    # Check if result_type() is a valid callable
+    if hasattr(_ImportedCheckerJob, "result_type") and callable(
+        getattr(_ImportedCheckerJob, "result_type", None)
+    ):
+        _CheckerResultType = _ImportedCheckerJob.result_type()
+    _CHECKER_AVAILABLE = True
+except (ImportError, AttributeError, TypeError) as _checker_err:
+    logger.info(
+        "PDFAccessibilityCheckerJob not available in this SDK version: %s",
+        _checker_err,
+    )
 
 
 class AdobeAccessibilityChecker:
@@ -71,6 +97,7 @@ class AdobeAccessibilityChecker:
                     }
                 ],
                 "score": float,  # 0.0-1.0
+                "check_failed": bool,  # True when result is due to an error, not actual check
             }
 
         Note: This is a stub implementation. The actual Adobe PDF
@@ -78,56 +105,91 @@ class AdobeAccessibilityChecker:
         PDFAccessibilityChecker operation which may not be available
         in all SDK versions. When unavailable, returns a basic result.
         """
-        try:
-            # Try to use the PDF Accessibility Checker operation
-            from adobe.pdfservices.operation.pdfjobs.jobs.pdf_accessibility_checker_job import (
-                PDFAccessibilityCheckerJob,
-            )
-            from adobe.pdfservices.operation.io.cloud_asset import CloudAsset
-            from adobe.pdfservices.operation.io.stream_asset import StreamAsset
-
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(pdf_bytes)
-                tmp_path = tmp.name
-
-            input_asset = self._pdf_services.upload(
-                input_stream=open(tmp_path, "rb"),
-                mime_type="application/pdf",
-            )
-
-            job = PDFAccessibilityCheckerJob(input_asset=input_asset)
-            location = self._pdf_services.submit(job)
-            response = self._pdf_services.get_job_result(
-                location, PDFAccessibilityCheckerJob.result_type(),
-            )
-
-            # Parse the checker report
-            report = response.get_result().get_report()
-            return self._parse_report(report)
-
-        except ImportError:
+        # HIGH-4.12: If the checker is not available, return immediately
+        if not _CHECKER_AVAILABLE:
             logger.warning(
                 "PDFAccessibilityCheckerJob not available in this SDK version. "
                 "Returning basic compliance result."
             )
             return {
-                "compliant": True,
-                "issues": [],
-                "score": 1.0,
+                "compliant": False,
+                "issues": [{"rule": "sdk_unavailable", "description": "Adobe Accessibility Checker SDK not available — compliance unknown", "severity": "moderate", "page": None}],
+                "score": 0.0,
+                "check_failed": True,
                 "note": "Full Adobe check unavailable — SDK version does not support PDFAccessibilityCheckerJob",
             }
-        except Exception as exc:
-            logger.warning("Adobe Accessibility Checker failed: %s", exc)
-            return {
-                "compliant": False,
-                "issues": [{
-                    "rule": "checker_error",
-                    "description": f"Adobe checker failed: {exc}",
-                    "severity": "moderate",
-                    "page": None,
-                }],
-                "score": 0.5,
-            }
+
+        # HIGH-4.7: Retry loop (up to 2 retries) for transient API errors
+        max_retries = 2
+        last_exc: Exception | None = None
+        tmp_path: str | None = None
+
+        for attempt in range(1, max_retries + 2):
+            try:
+                # HIGH-4.7: Fix file handle leak — use context manager
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(pdf_bytes)
+                    tmp_path = tmp.name
+
+                # Use context manager to avoid leaking the file handle
+                with open(tmp_path, "rb") as pdf_file:
+                    input_asset = self._pdf_services.upload(
+                        input_stream=pdf_file,
+                        mime_type="application/pdf",
+                    )
+
+                job = _PDFAccessibilityCheckerJob(input_asset=input_asset)
+                location = self._pdf_services.submit(job)
+
+                # HIGH-4.12: Use pre-validated result type
+                if _CheckerResultType is not None:
+                    response = self._pdf_services.get_job_result(
+                        location, _CheckerResultType,
+                    )
+                else:
+                    # Fallback: try passing the class itself
+                    response = self._pdf_services.get_job_result(
+                        location, _PDFAccessibilityCheckerJob,
+                    )
+
+                # Parse the checker report
+                report = response.get_result().get_report()
+                return self._parse_report(report)
+
+            except Exception as exc:
+                last_exc = exc
+                if attempt <= max_retries:
+                    wait = 2.0 ** attempt
+                    logger.warning(
+                        "Adobe Accessibility Checker attempt %d/%d failed: %s. "
+                        "Retrying in %.1fs.",
+                        attempt, max_retries + 1, exc, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    break
+            finally:
+                # Clean up temp file
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    tmp_path = None
+
+        # HIGH-4.7: Return score 0.0 (not 0.5) with check_failed flag
+        logger.warning("Adobe Accessibility Checker failed after retries: %s", last_exc)
+        return {
+            "compliant": False,
+            "issues": [{
+                "rule": "checker_error",
+                "description": f"Adobe checker failed: {last_exc}",
+                "severity": "moderate",
+                "page": None,
+            }],
+            "score": 0.0,
+            "check_failed": True,
+        }
 
     def _parse_report(self, report: Any) -> dict[str, Any]:
         """Parse Adobe Accessibility Checker report into normalized format."""

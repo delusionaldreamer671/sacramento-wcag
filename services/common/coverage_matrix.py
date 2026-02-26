@@ -178,11 +178,12 @@ _CONTENT_TYPES: list[dict] = [
         "description": "Text color, background contrast, use of color",
         "relevant_criteria": ["1.4.1", "1.4.3", "1.4.11"],
         "automated_actions": [
-            "Calculate contrast ratios for text and background",
             "Detect color-only information indicators",
         ],
         "ai_assisted_actions": [],
         "human_review_actions": [
+            "Calculate and verify contrast ratios for text and background "
+            "(requires rendered PDF — cannot be computed at IR stage)",
             "Verify color is not sole means of conveying info",
             "Review contrast for embedded images of text",
         ],

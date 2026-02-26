@@ -26,6 +26,7 @@ import {
   MessageSquare,
   Send,
 } from "lucide-react";
+import Link from "next/link";
 import {
   analyzeDocument,
   remediateDocument,
@@ -36,6 +37,7 @@ import { publishAnalysis } from "@/lib/analysis-store";
 import type {
   AnalysisResult,
   AnalysisProposal,
+  PipelineMetadata,
   RuleBreakdownEntry,
   RemediationReport,
   RemediationEvent,
@@ -1003,6 +1005,145 @@ function AnalysisSummaryBar({ summary }: { summary: AnalysisResult["summary"] })
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline Health Panel (B4)
+// ---------------------------------------------------------------------------
+
+// PipelineStage and PipelineMetadata are imported from @/lib/api — the
+// canonical type definitions live there to avoid duplication.
+
+function stageStatusIcon(status: string) {
+  switch (status) {
+    case "success":
+      return <CheckCircle2 className="h-4 w-4 text-green-600" aria-hidden="true" />;
+    case "degraded":
+      return <AlertCircle className="h-4 w-4 text-amber-500" aria-hidden="true" />;
+    case "skipped":
+      return <AlertCircle className="h-4 w-4 text-gray-400" aria-hidden="true" />;
+    case "failed":
+      return <X className="h-4 w-4 text-red-500" aria-hidden="true" />;
+    default:
+      return <AlertCircle className="h-4 w-4 text-gray-400" aria-hidden="true" />;
+  }
+}
+
+function stageName(name: string): string {
+  const labels: Record<string, string> = {
+    extract: "PDF Extraction",
+    deterministic_fixes: "Deterministic Fixes",
+    ai_alt_text: "AI Alt Text",
+    wcag_audit: "WCAG Audit",
+    build_html: "HTML Build",
+    validate: "Validation",
+    output: "Output",
+    verapdf_baseline: "VeraPDF Baseline",
+    verapdf_endline: "VeraPDF Endline",
+    post_remediation_audit: "Post-Remediation Audit",
+  };
+  return labels[name] || name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function PipelineHealthPanel({ metadata }: { metadata: PipelineMetadata }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const hasIssues = metadata.stages.some(
+    (s) => s.status === "degraded" || s.status === "skipped" || s.status === "failed",
+  );
+
+  return (
+    <div className="mt-4">
+      <button
+        type="button"
+        onClick={() => setExpanded(!expanded)}
+        className={`flex w-full items-center justify-between rounded-lg border px-4 py-3 text-left text-sm transition-colors ${
+          hasIssues
+            ? "border-amber-200 bg-amber-50 hover:bg-amber-100"
+            : "border-green-200 bg-green-50 hover:bg-green-100"
+        }`}
+        aria-expanded={expanded}
+      >
+        <div className="flex items-center gap-2">
+          {hasIssues ? (
+            <AlertCircle className="h-4 w-4 text-amber-500" aria-hidden="true" />
+          ) : (
+            <CheckCircle2 className="h-4 w-4 text-green-600" aria-hidden="true" />
+          )}
+          <span className="font-medium">
+            Pipeline Status: {metadata.overall_status === "success" ? "All stages passed" : `Some stages ${metadata.overall_status}`}
+          </span>
+          <span className="text-xs text-muted-foreground">
+            ({metadata.stages.length} stages)
+          </span>
+        </div>
+        {expanded ? (
+          <ChevronDown className="h-4 w-4" aria-hidden="true" />
+        ) : (
+          <ChevronRight className="h-4 w-4" aria-hidden="true" />
+        )}
+      </button>
+
+      {expanded && (
+        <div className="mt-2 rounded-lg border bg-white p-4">
+          <table className="w-full text-sm" aria-label="Pipeline stage details">
+            <thead>
+              <tr className="border-b text-left text-xs text-muted-foreground">
+                <th className="pb-2 font-medium">Stage</th>
+                <th className="pb-2 font-medium">Status</th>
+                <th className="pb-2 font-medium text-right">Duration</th>
+                <th className="pb-2 font-medium">Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {metadata.stages.map((stage, i) => (
+                <tr key={i} className="border-b last:border-0">
+                  <td className="py-2 font-medium">{stageName(stage.stage_name)}</td>
+                  <td className="py-2">
+                    <div className="flex items-center gap-1.5">
+                      {stageStatusIcon(stage.status)}
+                      <span className={
+                        stage.status === "success" ? "text-green-700" :
+                        stage.status === "degraded" ? "text-amber-700" :
+                        stage.status === "failed" ? "text-red-700" :
+                        "text-gray-500"
+                      }>
+                        {stage.status}
+                      </span>
+                    </div>
+                  </td>
+                  <td className="py-2 text-right text-muted-foreground">
+                    {stage.duration_ms > 0 ? `${(stage.duration_ms / 1000).toFixed(1)}s` : "—"}
+                  </td>
+                  <td className="py-2 text-xs text-muted-foreground">
+                    {stage.warnings.length > 0 && (
+                      <span className="text-amber-600">{stage.warnings[0]}</span>
+                    )}
+                    {stage.errors.length > 0 && (
+                      <span className="text-red-600">{stage.errors[0]}</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {/* Validation confidence summary */}
+          {metadata.validation_confidence && (
+            <div className="mt-3 flex gap-3 border-t pt-3 text-xs">
+              <span className="font-medium text-muted-foreground">Validation Confidence:</span>
+              <span className="text-green-700">{metadata.validation_confidence.high} high</span>
+              <span className="text-amber-700">{metadata.validation_confidence.medium} medium</span>
+              <span className="text-gray-500">{metadata.validation_confidence.low} low</span>
+              {metadata.validation_confidence.needs_human_review > 0 && (
+                <span className="text-red-600">{metadata.validation_confidence.needs_human_review} need review</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main page component
 // ---------------------------------------------------------------------------
 
@@ -1297,6 +1438,11 @@ export default function UploadPage() {
             {/* Summary bar */}
             <AnalysisSummaryBar summary={analysisResult.summary} />
 
+            {/* B4: Pipeline Health Panel */}
+            {analysisResult.pipeline_metadata && (
+              <PipelineHealthPanel metadata={analysisResult.pipeline_metadata} />
+            )}
+
             {/* File info */}
             <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
               <FileText className="h-4 w-4" aria-hidden="true" />
@@ -1328,12 +1474,12 @@ export default function UploadPage() {
                       Review AI-generated alt text before remediation
                     </p>
                   </div>
-                  <a
+                  <Link
                     href={`/alt-text/${analysisResult.task_id}`}
                     className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 transition-colors"
                   >
                     Review Alt Text
-                  </a>
+                  </Link>
                 </div>
               </div>
             )}
@@ -1478,7 +1624,7 @@ export default function UploadPage() {
         {state === "done" && report && report.events.length > 0 && (
           <PostRemediationReview
             events={report.events}
-            documentId={report.task_id}
+            documentId={null /* Sync conversions don't return a document_id; task_id is not valid here. Proposals require a real document_id. */}
           />
         )}
 

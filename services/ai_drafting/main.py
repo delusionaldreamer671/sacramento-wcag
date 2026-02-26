@@ -299,10 +299,16 @@ def _draft_image_element(
         )
         finding.complexity = ComplexityFlag.MANUAL
         finding.description += " AI drafting failed — flagged for manual remediation."
-        placeholder = "[MANUAL REMEDIATION REQUIRED — AI drafting failed]"
+        # HIGH-9.12: Placeholder must signal manual review requirement, not mimic
+        # a real description.  Include metadata so reviewers know this is a Vertex
+        # failure rather than a deliberate human decision.
+        placeholder = "Image requires manual alt text description"
         finding.ai_draft = placeholder
         finding.suggested_fix = placeholder
         item = _build_hitl_item(document_id, finding, element, placeholder)
+        # Store failure metadata in original_content so HITL dashboard can surface it
+        item.original_content["_ai_failure"] = True
+        item.original_content["_ai_failure_reason"] = str(exc)[:500]
         return finding, item
 
 
@@ -352,7 +358,10 @@ def _draft_table_element(
             "nesting_depth": int(element.get("nesting_depth", 0)),
             "caption_text": str(element.get("caption_text", "")),
         }
-        ai_suggestion = client.generate_table_structure(table_data)
+        table_analysis = client.generate_table_structure(table_data)
+        # Serialize the JSON analysis dict to a string for storage in
+        # string-typed fields (ai_draft, suggested_fix, ai_suggestion).
+        ai_suggestion = json.dumps(table_analysis)
         finding.ai_draft = ai_suggestion
         finding.suggested_fix = ai_suggestion
         item = _build_hitl_item(document_id, finding, element, ai_suggestion)
@@ -528,6 +537,19 @@ def _run_drafting_pipeline(
         (findings, hitl_items) — parallel lists of results.
     """
     elements = _load_elements_json(extraction_result.extracted_json_path)
+
+    # CRITICAL-2.2: An empty elements list means zero work will be done.
+    # This can indicate silent extraction failure rather than a legitimate
+    # text-only document.  Log a WARNING so the condition is visible in
+    # Cloud Run logs; callers should investigate whether extraction succeeded.
+    if not elements:
+        logger.warning(
+            "doc=%s: elements list is empty from %s — "
+            "AI drafting will produce zero review items. "
+            "Verify extraction succeeded and the document has extractable content.",
+            document_id,
+            extraction_result.extracted_json_path,
+        )
 
     images: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
@@ -747,12 +769,33 @@ async def draft_document(request: Request) -> DraftResponse:
         )
     except Exception as exc:
         logger.error(
-            "Failed to publish recompilation event for doc %s: %s",
+            "Failed to publish recompilation event for doc %s: %s — "
+            "updating document status to FAILED so it does not stall "
+            "indefinitely in ai_drafting state",
             document_id,
             exc,
         )
-        # Non-fatal: HITL items are already persisted to GCS.
-        # Log and continue — the dashboard can poll GCS directly.
+        # CRITICAL-2.1: Without this block the document stays in "ai_drafting"
+        # forever because the downstream service never receives the event.
+        # Publish a FAILED status event so the document state machine advances.
+        try:
+            publish_document_event(
+                topic_name=settings.pubsub_recompilation_topic,
+                document_id=document_id,
+                status=DocumentStatus.FAILED,
+                error_message=(
+                    f"Pub/Sub publish failed after AI drafting completed: {exc}"
+                ),
+            )
+        except Exception as inner_exc:
+            # Both publish attempts failed — log and give up.  The document
+            # will stall, but we've logged enough detail for ops to recover.
+            logger.error(
+                "Failed to publish FAILED status for doc %s after recompilation "
+                "publish also failed: %s",
+                document_id,
+                inner_exc,
+            )
 
     manual_count = sum(
         1 for item in review_items

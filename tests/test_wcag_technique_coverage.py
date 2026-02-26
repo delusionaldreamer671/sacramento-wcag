@@ -429,22 +429,23 @@ class TestRunFullAuditMinimalDoc:
 
         Expected FAILs:
         - 2.4.5: bookmarks require heading structure (no headings in minimal doc)
-        - 1.4.3, 1.4.10, 1.4.11, 1.4.12, 2.1.1: cannot be verified automatically
+        - 1.4.10, 1.4.11, 1.4.12, 2.1.1: cannot be verified automatically
           (these correctly FAIL with MANUAL_REVIEW instead of false PASS)
         All other rules should be PASS or NOT_APPLICABLE.
+
+        Note: 1.4.3 (contrast), 2.4.3 (focus order), and 2.4.7 (focus visible)
+        return NOT_APPLICABLE because contrast cannot be determined at IR stage
+        and the minimal doc has no interactive elements.
         """
         result = run_full_audit(_make_minimal_doc())
         # Rules that are expected to FAIL on any document
         expected_fail_criteria = {
             "2.4.5",   # No headings → no bookmarks
-            "1.4.3",   # Contrast cannot be automated
             "1.4.10",  # Reflow cannot be automated
             "1.4.11",  # Non-text contrast cannot be automated
             "1.4.12",  # Text spacing cannot be automated
             "2.1.1",   # Keyboard cannot be automated
             "1.3.4",   # Orientation cannot be automated
-            "2.4.3",   # Focus order cannot be automated
-            "2.4.7",   # Focus visible cannot be automated
             "3.1.2",   # Language of parts cannot be automated
         }
         unexpected_fails = [
@@ -635,10 +636,13 @@ class TestAuditSummaryDict:
             metadata={"title": "Clean Document", "language": "en"},
         )
         result = run_full_audit(doc)
-        # All FAIL findings on a clean doc should be manual-review stubs
+        # All FAIL findings on a clean doc should be manual-review stubs.
+        # Note: 1.4.3 (contrast), 2.4.3 (focus order), and 2.4.7 (focus visible)
+        # now return NOT_APPLICABLE because contrast cannot be determined at IR stage
+        # and the clean doc has no interactive elements for focus checks.
         manual_review_criteria = {
-            "1.3.4", "1.4.3", "1.4.10", "1.4.11", "1.4.12",
-            "2.1.1", "2.4.3", "2.4.7", "3.1.2",
+            "1.3.4", "1.4.10", "1.4.11", "1.4.12",
+            "2.1.1", "3.1.2",
         }
         non_stub_fails = [
             f for f in result.findings
@@ -1230,8 +1234,8 @@ class TestDocumentTitleChecks:
             f"Document with metadata title should pass 2.4.2, got: {title_findings}"
         )
 
-    def test_empty_metadata_falls_back_to_filename(self):
-        """Document with no metadata title uses filename as fallback and passes 2.4.2."""
+    def test_empty_metadata_falls_back_to_filename_stem_detected(self):
+        """Document with no metadata title falls back to filename stem — detected as non-descriptive (F25)."""
         doc = IRDocument(
             document_id="test-filename-title",
             filename="annual-report-2025.pdf",
@@ -1241,14 +1245,34 @@ class TestDocumentTitleChecks:
             metadata={},
         )
         result = run_full_audit(doc)
-        # The checker falls back to filename_base when no title in metadata;
-        # "annual-report-2025" is a non-empty string so should not fail
+        # The checker falls back to filename_base "annual-report-2025" which is
+        # a filename stem pattern (all-lowercase with hyphens) — should fail F25
+        title_findings = [
+            f for f in result.findings
+            if f.rule_id == "wcag_2_4_2" and f.status == FindingStatus.FAIL
+        ]
+        assert len(title_findings) >= 1, (
+            f"Filename stem 'annual-report-2025' should fail 2.4.2 (F25), got: {title_findings}"
+        )
+
+    def test_empty_metadata_with_descriptive_filename_passes(self):
+        """Document with no metadata title but a descriptive filename passes 2.4.2."""
+        doc = IRDocument(
+            document_id="test-filename-title-good",
+            filename="Sacramento County Annual Report 2025.pdf",
+            page_count=1,
+            pages=[IRPage(page_num=1, blocks=[])],
+            language="en",
+            metadata={},
+        )
+        result = run_full_audit(doc)
+        # "Sacramento County Annual Report 2025" has spaces and mixed case — not a filename stem
         title_findings = [
             f for f in result.findings
             if f.rule_id == "wcag_2_4_2" and f.status == FindingStatus.FAIL
         ]
         assert len(title_findings) == 0, (
-            f"Filename fallback should allow 2.4.2 to pass, got: {title_findings}"
+            f"Descriptive filename should pass 2.4.2, got: {title_findings}"
         )
 
     def test_title_finding_always_produced(self):

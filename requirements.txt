@@ -2,58 +2,58 @@
 # Python 3.11+
 
 # Web framework
-fastapi>=0.109.0,<0.120.0
-uvicorn[standard]>=0.27.0,<0.30.0
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
 
 # Data validation
-pydantic>=2.5.0,<3.0.0
-pydantic-settings>=2.1.0,<3.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
 
 # GCP services
-google-cloud-storage>=2.14.0,<3.0.0
-google-cloud-pubsub>=2.19.0,<3.0.0
-google-cloud-aiplatform>=1.38.0,<2.0.0
-google-cloud-documentai>=2.20.0,<3.0.0
+google-cloud-storage==2.14.0
+google-cloud-pubsub==2.19.0
+google-cloud-aiplatform==1.38.0
+google-cloud-documentai==2.20.0
 
 # Adobe Acrobat Services
-pdfservices-sdk>=4.0.0,<5.0.0
+pdfservices-sdk==4.0.0
 
 # HTTP client
-httpx>=0.26.0,<1.0.0
+httpx==0.26.0
 
 # Accessibility testing (real axe-core via headless browser)
-playwright>=1.40.0,<2.0.0
+playwright==1.40.0
 
 # Testing
-pytest>=7.4.0,<9.0.0
-pytest-asyncio>=0.23.0,<1.0.0
-pytest-cov>=4.1.0,<6.0.0
+pytest==7.4.0
+pytest-asyncio==0.23.0
+pytest-cov==4.1.0
 
 # PDF reading / manipulation
-pypdf>=4.0.0,<5.0.0
-reportlab>=4.0.0,<5.0.0
-pikepdf>=8.0.0,<10.0.0
-PyMuPDF>=1.23.0,<2.0.0
+pypdf==4.0.0
+reportlab==4.0.0
+pikepdf==8.0.0
+PyMuPDF==1.23.0
 
 # HTML parsing (accessibility validation)
-beautifulsoup4>=4.12.0,<5.0.0
-lxml>=5.0.0,<6.0.0
+beautifulsoup4==4.12.0
+lxml==5.0.0
 
 # PostgreSQL (optional — only needed when WCAG_DB_BACKEND=postgres)
-psycopg[binary]>=3.1.0,<4.0.0
+psycopg[binary]==3.1.0
 
 # Password hashing (argon2id for new tokens, sha256 fallback for legacy tokens)
-argon2-cffi>=23.1.0,<25.0.0
+argon2-cffi==23.1.0
 
 # Utilities
-python-multipart>=0.0.6,<1.0.0
-python-dotenv>=1.0.0,<2.0.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
 
 # Database migrations
-alembic>=1.13.0,<2.0.0
-sqlalchemy>=2.0.0,<3.0.0
+alembic==1.13.0
+sqlalchemy==2.0.0
 
 # Observability
-prometheus-fastapi-instrumentator>=7.0.0
-prometheus-client>=0.20.0
-opentelemetry-instrumentation-logging>=0.44b0
+prometheus-fastapi-instrumentator==7.0.0
+prometheus-client==0.20.0
+opentelemetry-instrumentation-logging==0.44b0

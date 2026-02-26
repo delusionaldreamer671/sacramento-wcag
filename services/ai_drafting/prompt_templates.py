@@ -113,45 +113,49 @@ def build_alt_text_prompt(
 # ---------------------------------------------------------------------------
 
 TABLE_STRUCTURE_SYSTEM_PROMPT: str = """\
-You are an expert accessibility engineer specialising in semantic HTML table \
-markup for government PDF documents that must comply with WCAG 2.1 Success \
-Criterion 1.3.1 (Info and Relationships) at Level AA and the PDF/UA \
-(ISO 14289-1) table structure requirements.
+You are an expert accessibility engineer analysing table structure in \
+government PDF documents for compliance with WCAG 2.1 Success Criterion \
+1.3.1 (Info and Relationships) at Level AA and the PDF/UA (ISO 14289-1) \
+table structure requirements.
 
-WCAG 1.3.1 TABLE REQUIREMENTS:
-- Data tables must use <th> elements with appropriate scope attributes for \
-  all header cells.
-- scope="col" for column headers.
-- scope="row" for row headers.
-- scope="colgroup" and scope="rowgroup" for spanning header groups.
-- For complex tables with irregular headers, use id and headers attributes \
-  instead of scope.
-- Use <caption> to provide a title or brief description of the table.
-- Use <thead>, <tbody>, and <tfoot> to group rows logically.
-- Data cells use <td>; never use <td> for header information.
-- Empty cells must still be present as <td></td> to maintain grid structure.
-- Merged cells must use colspan and rowspan attributes accurately.
-- Avoid layout tables; if a table is purely for layout, use role="presentation".
+YOUR TASK:
+Analyse the table structure and return a JSON object describing its \
+header layout and characteristics. Do NOT generate HTML — only analyse \
+the structure so that a deterministic builder can construct the correct \
+semantic HTML from the original cell data.
 
-HTML OUTPUT STANDARDS:
-- Produce well-formed, indented HTML using 2-space indentation.
-- Include a <caption> element as the first child of <table>.
-- Wrap header rows in <thead>, data rows in <tbody>.
-- Include tfoot only if the source data has summary/total rows at the bottom.
-- All attribute values must be double-quoted.
-- Do not include inline styles, class attributes, or JavaScript.
-- Do not wrap the output in markdown code fences or any other container.
+ANALYSIS RULES:
+- header_row_count: Count how many rows at the top of the table act as \
+  column headers. Most simple tables have 1 header row. Multi-level \
+  header tables may have 2 or more. Tables with no column headers have 0.
+- header_col_count: Count how many columns on the left act as row headers. \
+  Most tables have 0 or 1 row-header columns. Budget/matrix tables often \
+  have 1. Set to 0 if no left-side columns serve as row identifiers.
+- suggested_caption: Write a concise, descriptive caption (title) for the \
+  table based on its content and surrounding context. Use plain language \
+  appropriate for government documents. If a caption is already provided \
+  in the metadata, improve it if vague, or return it unchanged if adequate.
+- has_merged_cells: Set to true if the table data shows evidence of cells \
+  spanning multiple rows or columns (colspan > 1 or rowspan > 1). \
+  Otherwise false.
+
+OUTPUT FORMAT:
+Return ONLY a valid JSON object with exactly these four keys:
+{
+    "header_row_count": <integer>,
+    "header_col_count": <integer>,
+    "suggested_caption": "<string>",
+    "has_merged_cells": <boolean>
+}
 
 OUTPUT RULES:
-- Return ONLY the complete <table>...</table> HTML block.
-- No explanation, commentary, or markdown formatting around the HTML.
-- The output must be parseable by an HTML5 parser without errors.
+- Return ONLY the JSON object — no markdown, no code fences, no explanation.
+- The JSON must be valid and parseable by Python's json.loads().
+- Do not include any additional keys beyond the four specified above.
 """
 
 TABLE_STRUCTURE_USER_TEMPLATE: str = """\
-Convert the following table data extracted from a Sacramento County PDF into \
-fully accessible semantic HTML that satisfies WCAG 1.3.1 and PDF/UA \
-table structure requirements.
+Analyze this table extracted from a Sacramento County government PDF document.
 
 SOURCE TABLE METADATA:
 - Table ID in document: {table_id}
@@ -172,10 +176,13 @@ COLUMN HEADERS (if separately identified by the extraction tool):
 ROW HEADERS (if separately identified by the extraction tool):
 {row_headers}
 
-Produce the semantic HTML table. Infer header scope from the structure when \
-explicit header identification is ambiguous. If the table appears to be purely \
-for layout (no data relationship between cells), output \
-<table role="presentation"> with no <th> elements.
+Return ONLY a valid JSON object matching this exact schema:
+{{
+    "header_row_count": <int>,
+    "header_col_count": <int>,
+    "suggested_caption": "<string>",
+    "has_merged_cells": <bool>
+}}
 """
 
 

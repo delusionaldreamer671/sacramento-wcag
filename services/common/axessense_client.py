@@ -64,7 +64,12 @@ class AxesSenseClient:
         self._timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
     def is_available(self) -> bool:
-        """Check if axesSense API is reachable and configured."""
+        """Check if axesSense API is reachable, configured, and authenticated.
+
+        MEDIUM-4.13: Check for HTTP 200 specifically, not just < 500.
+        A 401 response means the API key is invalid — the service is not
+        usable even though it is reachable.
+        """
         if not self._base_url or not self._api_key:
             return False
         try:
@@ -73,7 +78,7 @@ class AxesSenseClient:
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0),
             )
-            return resp.status_code < 500
+            return resp.status_code == 200
         except (httpx.ConnectError, httpx.TimeoutException, OSError):
             logger.debug("axesSense not reachable at %s", self._base_url)
             return False

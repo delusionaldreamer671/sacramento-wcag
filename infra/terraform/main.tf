@@ -30,12 +30,15 @@ terraform {
     }
   }
 
-  # Remote state backend — replace with your GCS bucket after initial bootstrap.
-  # For local dev, comment out this block and use local state.
-  # backend "gcs" {
-  #   bucket = "sacto-wcag-tf-state"
-  #   prefix = "terraform/state"
-  # }
+  # Remote state backend — enables state locking and prevents divergent state
+  # from multiple operators applying concurrently.
+  # For local dev only, comment out this block and use local state.
+  # The GCS bucket "sacto-wcag-tf-state" must exist before running terraform init.
+  # Create it once manually: gsutil mb -l US gs://sacto-wcag-tf-state
+  backend "gcs" {
+    bucket = "sacto-wcag-tf-state"
+    prefix = "terraform/state"
+  }
 }
 
 ###############################################################################
@@ -80,7 +83,7 @@ locals {
     WCAG_PUBSUB_AI_DRAFTING_SUBSCRIPTION   = google_pubsub_subscription.ai_drafting_sub.name
     WCAG_PUBSUB_RECOMPILATION_SUBSCRIPTION = google_pubsub_subscription.recompilation_sub.name
     WCAG_VERTEX_AI_LOCATION        = var.region
-    WCAG_VERTEX_AI_MODEL           = "gemini-1.5-pro-002"
+    WCAG_VERTEX_AI_MODEL           = "gemini-2.5-pro"
     # Retry config: 3 retries matches the NFR; base 2.0 gives 2s/4s/8s backoff
     WCAG_MAX_RETRIES               = "3"
     WCAG_RETRY_BACKOFF_BASE        = "2.0"
@@ -522,14 +525,31 @@ resource "google_cloud_run_v2_service" "ingestion" {
       # Never hardcoded — sourced from CI/CD pipeline secrets or manual
       # `gcloud run services update --update-secrets` commands.
       # These env names match pydantic-settings fields in services/common/config.py.
+      #
+      # IMPORTANT: The empty string values below are PLACEHOLDER STUBS only.
+      # They are overwritten at deploy time by Cloud Build using Secret Manager:
+      #   gcloud run services update sacto-wcag-ingestion \
+      #     --update-secrets=WCAG_ADOBE_CLIENT_ID=adobe-client-id:latest \
+      #     --update-secrets=WCAG_ADOBE_CLIENT_SECRET=adobe-client-secret:latest
+      #
+      # WARNING: Running `terraform apply` on a live service will reset these to
+      # empty strings, breaking Adobe API calls. To prevent this, use Secret Manager
+      # references directly (data "google_secret_manager_secret_version") or ensure
+      # `gcloud run services update --update-secrets` is always run after any
+      # `terraform apply`. Never run `terraform apply` on prod without immediately
+      # re-injecting credentials.
+      #
+      # Preferred long-term approach: Replace the empty-string `value` with a
+      # `value_source { secret_key_ref { secret = "adobe-client-id"; version = "latest" } }`
+      # block once the GCP Secret Manager secrets are bootstrapped.
       env {
         name  = "WCAG_ADOBE_CLIENT_ID"
-        value = "" # Replaced at deploy time: --update-secrets WCAG_ADOBE_CLIENT_ID=adobe-client-id:latest
+        value = "" # PLACEHOLDER — overwritten at deploy time (see comment above)
       }
 
       env {
         name  = "WCAG_ADOBE_CLIENT_SECRET"
-        value = "" # Replaced at deploy time: --update-secrets WCAG_ADOBE_CLIENT_SECRET=adobe-client-secret:latest
+        value = "" # PLACEHOLDER — overwritten at deploy time (see comment above)
       }
 
       liveness_probe {
@@ -620,14 +640,15 @@ resource "google_cloud_run_v2_service" "extraction" {
         value = "extraction"
       }
 
+      # PLACEHOLDER — overwritten at deploy time via --update-secrets (see ingestion service comment)
       env {
         name  = "WCAG_ADOBE_CLIENT_ID"
-        value = ""
+        value = "" # PLACEHOLDER — overwritten at deploy time
       }
 
       env {
         name  = "WCAG_ADOBE_CLIENT_SECRET"
-        value = ""
+        value = "" # PLACEHOLDER — overwritten at deploy time
       }
 
       liveness_probe {
@@ -813,14 +834,15 @@ resource "google_cloud_run_v2_service" "recompilation" {
         value = "recompilation"
       }
 
+      # PLACEHOLDER — overwritten at deploy time via --update-secrets (see ingestion service comment)
       env {
         name  = "WCAG_ADOBE_CLIENT_ID"
-        value = ""
+        value = "" # PLACEHOLDER — overwritten at deploy time
       }
 
       env {
         name  = "WCAG_ADOBE_CLIENT_SECRET"
-        value = ""
+        value = "" # PLACEHOLDER — overwritten at deploy time
       }
 
       liveness_probe {

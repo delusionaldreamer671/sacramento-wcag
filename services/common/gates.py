@@ -29,7 +29,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from services.common.ir import BlockType, IRBlock, IRDocument
+from services.common.ir import BlockType, IRBlock, IRDocument, ValidationMode
 
 logger = logging.getLogger(__name__)
 
@@ -332,8 +332,9 @@ def run_gate_g2(ir_doc: IRDocument) -> GateResult:
 _RE_LANG = re.compile(r'<html[^>]*\blang="([^"]+)"', re.IGNORECASE)
 _RE_IMG_NO_ALT = re.compile(r'<img(?![^>]*\balt=)[^>]*>', re.IGNORECASE)
 _RE_IMG_NO_SRC = re.compile(r'<img(?![^>]*\bsrc=)[^>]*>', re.IGNORECASE)
-_RE_IMG_EMPTY_SRC = re.compile(r'<img[^>]*\bsrc\s*=\s*""\s*[^>]*>', re.IGNORECASE)
-_RE_TH_SCOPE = re.compile(r'<th[^>]*\bscope="(col|row)"', re.IGNORECASE)
+_RE_IMG_EMPTY_SRC = re.compile(r'<img[^>]*\bsrc\s*=\s*(?:""|\'\')\s*[^>]*>', re.IGNORECASE)
+_RE_TH_SCOPE = re.compile(r'<th[^>]*\bscope=["\'](?:col|row)["\']', re.IGNORECASE)
+_RE_TABLE = re.compile(r'<table\b[^>]*>.*?</table>', re.IGNORECASE | re.DOTALL)
 _RE_HEADING = re.compile(r'<h(\d)\b', re.IGNORECASE)
 _RE_PARA_TEXT = re.compile(r'<p[^>]*>(.*?)</p>', re.IGNORECASE | re.DOTALL)
 
@@ -345,11 +346,19 @@ _SHORT_PARA_CHAR_LIMIT = 60   # paragraphs shorter than this are considered "sho
 _SHORT_PARA_RUN_THRESHOLD = 5  # flag if this many consecutive short paragraphs found
 
 
-def run_gate_g3(html: str) -> GateResult:
+def run_gate_g3(html: str, mode: ValidationMode = ValidationMode.PUBLISH) -> GateResult:
     """G3: axe-core scan + structural HTML validation.
 
     Tries real axe-core first (via playwright). Falls back to regex-based
     structural checks if playwright is not available.
+
+    Args:
+        html: HTML string to validate.
+        mode: ValidationMode.PUBLISH (default) enforces all checks as-is.
+              ValidationMode.DRAFT downgrades axe critical/serious violations
+              from P0/hard_fail to P1/soft_fail (flag_hitl instead of block).
+              Structural P0 checks (html_lang, img_alt, img_src,
+              content_no_headings) always block regardless of mode.
     """
     checks: list[GateCheck] = []
 
@@ -360,6 +369,23 @@ def run_gate_g3(html: str) -> GateResult:
     # 2. Structural checks (always run — catch things axe doesn't)
     structural_checks = _run_structural_checks(html)
     checks.extend(structural_checks)
+
+    # 3. In DRAFT mode, downgrade axe-related hard_fail checks to soft_fail.
+    #    Structural P0 checks (html_lang, img_alt, img_src, content_no_headings)
+    #    always block in both modes and are NOT downgraded here.
+    _STRUCTURAL_P0_CHECKS = frozenset(
+        {"html_lang", "img_alt", "img_src", "content_no_headings"}
+    )
+    if mode == ValidationMode.DRAFT:
+        for check in checks:
+            if (
+                check.status == "hard_fail"
+                and check.check_name.startswith("axe_")
+                and check.check_name not in _STRUCTURAL_P0_CHECKS
+            ):
+                check.status = "soft_fail"
+                check.priority = "P1"
+                check.next_action = "flag_hitl"
 
     passed = not any(c.status == "hard_fail" for c in checks)
     return GateResult(gate_id="G3", passed=passed, checks=checks)
@@ -374,9 +400,11 @@ def _run_axe_checks(html: str) -> list[GateCheck]:
         if not is_available():
             checks.append(GateCheck(
                 gate_id="G3", check_name="axe_availability",
-                status="soft_fail", severity="moderate",
-                priority="P2", next_action="proceed",
-                details="axe-core not available (playwright or axe-core not installed). Using fallback checks only.",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="axe-core NOT available (playwright or axe-core not installed). "
+                        "Accessibility validation is DEGRADED — structural checks only. "
+                        "This does NOT mean the document passed axe-core.",
             ))
             return checks
 
@@ -418,13 +446,14 @@ def _run_axe_checks(html: str) -> list[GateCheck]:
                 details=f"axe-core: {axe_results.get('passes', 0)} rules passed, 0 violations",
             ))
 
-    except Exception as exc:
-        logger.warning("axe-core scan failed: %s", exc)
+    except (ImportError, FileNotFoundError, OSError, RuntimeError) as exc:
+        logger.warning("axe-core scan failed (tool unavailable): %s", exc)
         checks.append(GateCheck(
             gate_id="G3", check_name="axe_error",
-            status="soft_fail", severity="moderate",
-            priority="P2", next_action="proceed",
-            details=f"axe-core scan failed: {exc}",
+            status="soft_fail", severity="serious",
+            priority="P1", next_action="flag_hitl",
+            details=f"axe-core scan FAILED: {exc}. "
+                    "Accessibility validation is DEGRADED — structural checks only.",
         ))
 
     return checks
@@ -476,22 +505,44 @@ def _run_structural_checks(html: str) -> list[GateCheck]:
             ),
         ))
 
-    # Check 4: Tables have <th scope>
-    if "<table" in html.lower():
-        if _RE_TH_SCOPE.search(html):
+    # Check 4: Tables have <th scope> — check EACH table individually
+    tables = _RE_TABLE.findall(html)
+    if tables:
+        tables_with_headers = sum(1 for t in tables if _RE_TH_SCOPE.search(t))
+        tables_without_headers = len(tables) - tables_with_headers
+        if tables_without_headers == 0:
             checks.append(GateCheck(
                 gate_id="G3", check_name="table_headers",
                 status="pass", severity="minor",
                 priority="P2", next_action="proceed",
-                details="Tables have <th scope> headers",
+                details=f"All {len(tables)} table(s) have <th scope> headers",
             ))
         else:
             checks.append(GateCheck(
                 gate_id="G3", check_name="table_headers",
                 status="hard_fail", severity="serious",
                 priority="P1", next_action="flag_hitl",
-                details="Tables present but no <th scope> found (WCAG 1.3.1)",
+                details=(
+                    f"{tables_without_headers} of {len(tables)} table(s) missing "
+                    f"<th scope> headers (WCAG 1.3.1)"
+                ),
             ))
+
+    # Check 5a (NEW): Content fidelity — document must have headings
+    # A multi-page document with zero headings means extraction failed.
+    heading_count = len(_RE_HEADING.findall(html))
+    para_count = len(_RE_PARA_TEXT.findall(html))
+    if heading_count == 0 and para_count > 5:
+        checks.append(GateCheck(
+            gate_id="G3", check_name="content_no_headings",
+            status="hard_fail", severity="critical",
+            priority="P0", next_action="block",
+            details=(
+                f"Document has {para_count} paragraphs but ZERO headings. "
+                "Structural extraction likely failed — output is flat text dump. "
+                "Cannot deliver without heading structure (WCAG 2.4.6)."
+            ),
+        ))
 
     # Check 5: Heading hierarchy doesn't skip levels
     headings = [int(m) for m in _RE_HEADING.findall(html)]
@@ -571,10 +622,15 @@ def run_gate_g4(pdf_bytes: bytes) -> GateResult:
 
     # Try Adobe Accessibility Checker
     adobe_checks = _run_adobe_checker(pdf_bytes)
-    if adobe_checks is not None:
-        checks.extend(adobe_checks)
-    else:
-        # Fallback: basic PDF tag structure check
+    checks.extend(adobe_checks)
+
+    # If Adobe was unavailable (indicated by an unavailability/error check),
+    # ALSO run basic structural checks as supplementary coverage.
+    adobe_unavailable = any(
+        c.check_name in ("adobe_checker_unavailable", "adobe_checker_import_error", "adobe_checker_error")
+        for c in adobe_checks
+    )
+    if adobe_unavailable:
         fallback_checks = _run_pdf_tag_check(pdf_bytes)
         checks.extend(fallback_checks)
 
@@ -583,11 +639,25 @@ def run_gate_g4(pdf_bytes: bytes) -> GateResult:
 
 
 def _run_adobe_checker(pdf_bytes: bytes) -> list[GateCheck] | None:
-    """Run Adobe PDF Accessibility Checker if available."""
+    """Run Adobe PDF Accessibility Checker if available.
+
+    Returns None ONLY when credentials are not configured (expected in dev).
+    Returns an explicit unavailability check when the checker fails at runtime.
+    """
     try:
         from services.common.config import settings
         if not settings.adobe_client_id or not settings.adobe_checker_enabled:
-            return None
+            # Credentials not configured — return explicit "unavailable" check
+            # so callers know Adobe validation did NOT run.
+            return [GateCheck(
+                gate_id="G4", check_name="adobe_checker_unavailable",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="Adobe PDF Accessibility Checker NOT configured "
+                        "(missing credentials or disabled). "
+                        "PDF/UA compliance was NOT validated by Adobe. "
+                        "Falling back to basic structural checks.",
+            )]
 
         from services.extraction.adobe_checker import AdobeAccessibilityChecker
         checker = AdobeAccessibilityChecker()
@@ -617,24 +687,46 @@ def _run_adobe_checker(pdf_bytes: bytes) -> list[GateCheck] | None:
         return checks
 
     except ImportError:
-        return None
-    except Exception as exc:
+        return [GateCheck(
+            gate_id="G4", check_name="adobe_checker_import_error",
+            status="soft_fail", severity="serious",
+            priority="P1", next_action="flag_hitl",
+            details="Adobe PDF Accessibility Checker SDK not installed. "
+                    "PDF/UA compliance was NOT validated.",
+        )]
+    except (FileNotFoundError, OSError, RuntimeError, ConnectionError, TimeoutError) as exc:
         logger.warning("Adobe checker failed: %s", exc)
-        return None
+        return [GateCheck(
+            gate_id="G4", check_name="adobe_checker_error",
+            status="soft_fail", severity="serious",
+            priority="P1", next_action="flag_hitl",
+            details=f"Adobe PDF Accessibility Checker FAILED: {exc}. "
+                    "PDF/UA compliance was NOT validated.",
+        )]
 
 
 def _run_pdf_tag_check(pdf_bytes: bytes) -> list[GateCheck]:
-    """Fallback: basic PDF structure validation via pypdf."""
+    """Fallback: PDF structure validation via pikepdf (preferred) or pypdf.
+
+    When Adobe is unavailable, this fallback must perform real accessibility
+    checks — not just page count and file size. Uses pikepdf to inspect
+    /StructTreeRoot, /MarkInfo, and /Lang in the PDF catalog.
+    """
     checks: list[GateCheck] = []
 
+    # Try pikepdf first — it provides access to the PDF catalog for real
+    # accessibility structure checks (/StructTreeRoot, /MarkInfo, /Lang)
+    pikepdf_available = False
     try:
-        from pypdf import PdfReader
+        import pikepdf  # noqa: PLC0415
         import io
 
-        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pikepdf_available = True
+        pdf = pikepdf.open(io.BytesIO(pdf_bytes))
 
         # Check 1: Has pages
-        if len(reader.pages) == 0:
+        page_count = len(pdf.pages)
+        if page_count == 0:
             checks.append(GateCheck(
                 gate_id="G4", check_name="pdf_has_pages",
                 status="hard_fail", severity="critical",
@@ -646,27 +738,10 @@ def _run_pdf_tag_check(pdf_bytes: bytes) -> list[GateCheck]:
                 gate_id="G4", check_name="pdf_has_pages",
                 status="pass", severity="minor",
                 priority="P2", next_action="proceed",
-                details=f"PDF has {len(reader.pages)} page(s)",
+                details=f"PDF has {page_count} page(s)",
             ))
 
-        # Check 2: PDF metadata exists
-        meta = reader.metadata
-        if meta:
-            checks.append(GateCheck(
-                gate_id="G4", check_name="pdf_metadata",
-                status="pass", severity="minor",
-                priority="P2", next_action="proceed",
-                details="PDF has metadata",
-            ))
-        else:
-            checks.append(GateCheck(
-                gate_id="G4", check_name="pdf_metadata",
-                status="soft_fail", severity="moderate",
-                priority="P1", next_action="flag_hitl",
-                details="PDF missing metadata",
-            ))
-
-        # Check 3: Basic size sanity
+        # Check 2: Basic size sanity
         if len(pdf_bytes) < 100:
             checks.append(GateCheck(
                 gate_id="G4", check_name="pdf_size",
@@ -675,20 +750,139 @@ def _run_pdf_tag_check(pdf_bytes: bytes) -> list[GateCheck]:
                 details=f"PDF suspiciously small: {len(pdf_bytes)} bytes",
             ))
 
+        # Check 3: /StructTreeRoot — required for tagged PDF / PDF/UA
+        catalog = pdf.Root
+        has_struct_tree = "/StructTreeRoot" in catalog
+        if has_struct_tree:
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_struct_tree_root",
+                status="pass", severity="minor",
+                priority="P2", next_action="proceed",
+                details="PDF has /StructTreeRoot (tagged PDF)",
+            ))
+        else:
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_struct_tree_root",
+                status="hard_fail", severity="critical",
+                priority="P0", next_action="block",
+                details="PDF missing /StructTreeRoot — document is NOT tagged (PDF/UA requires tag structure)",
+            ))
+
+        # Check 4: /MarkInfo — indicates document is marked (tagged)
+        has_mark_info = "/MarkInfo" in catalog
+        if has_mark_info:
+            marked = False
+            mark_info = catalog.get("/MarkInfo")
+            if mark_info and "/Marked" in mark_info:
+                marked = bool(mark_info["/Marked"])
+            if marked:
+                checks.append(GateCheck(
+                    gate_id="G4", check_name="pdf_mark_info",
+                    status="pass", severity="minor",
+                    priority="P2", next_action="proceed",
+                    details="PDF /MarkInfo indicates document is marked (tagged)",
+                ))
+            else:
+                checks.append(GateCheck(
+                    gate_id="G4", check_name="pdf_mark_info",
+                    status="soft_fail", severity="serious",
+                    priority="P1", next_action="flag_hitl",
+                    details="PDF has /MarkInfo but Marked is not true",
+                ))
+        else:
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_mark_info",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="PDF missing /MarkInfo dictionary",
+            ))
+
+        # Check 5: /Lang — document language (WCAG 3.1.1, PDF/UA requirement)
+        has_lang = "/Lang" in catalog
+        if has_lang:
+            lang_value = str(catalog["/Lang"])
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_lang",
+                status="pass", severity="minor",
+                priority="P2", next_action="proceed",
+                details=f"PDF has /Lang attribute: {lang_value}",
+            ))
+        else:
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_lang",
+                status="hard_fail", severity="critical",
+                priority="P0", next_action="block",
+                details="PDF missing /Lang attribute (WCAG 3.1.1 / PDF/UA requires document language)",
+            ))
+
+        pdf.close()
+
+    except ImportError:
+        # pikepdf not available — fall through to pypdf basic checks below
+        pass
     except Exception as exc:
         checks.append(GateCheck(
             gate_id="G4", check_name="pdf_parse_error",
             status="hard_fail", severity="critical",
             priority="P0", next_action="block",
-            details=f"Failed to parse PDF: {exc}",
+            details=f"Failed to parse PDF with pikepdf: {exc}",
         ))
+        return checks
 
-    if not checks:
+    # If pikepdf was not available, fall back to pypdf for basic checks
+    # plus a hard_fail indicating no real validation tool ran
+    if not pikepdf_available:
+        try:
+            from pypdf import PdfReader  # noqa: PLC0415
+            import io
+
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+
+            # Check 1: Has pages
+            if len(reader.pages) == 0:
+                checks.append(GateCheck(
+                    gate_id="G4", check_name="pdf_has_pages",
+                    status="hard_fail", severity="critical",
+                    priority="P0", next_action="block",
+                    details="PDF has zero pages",
+                ))
+            else:
+                checks.append(GateCheck(
+                    gate_id="G4", check_name="pdf_has_pages",
+                    status="pass", severity="minor",
+                    priority="P2", next_action="proceed",
+                    details=f"PDF has {len(reader.pages)} page(s)",
+                ))
+
+            # Check 2: Basic size sanity
+            if len(pdf_bytes) < 100:
+                checks.append(GateCheck(
+                    gate_id="G4", check_name="pdf_size",
+                    status="hard_fail", severity="critical",
+                    priority="P0", next_action="block",
+                    details=f"PDF suspiciously small: {len(pdf_bytes)} bytes",
+                ))
+
+        except Exception as exc:
+            checks.append(GateCheck(
+                gate_id="G4", check_name="pdf_parse_error",
+                status="hard_fail", severity="critical",
+                priority="P0", next_action="block",
+                details=f"Failed to parse PDF: {exc}",
+            ))
+
+        # CRITICAL: Neither Adobe nor pikepdf ran real validation.
+        # pypdf only checks page count and file size — an untagged PDF passes.
+        # This MUST be a hard_fail to prevent false compliance claims.
         checks.append(GateCheck(
-            gate_id="G4", check_name="pdf_basic",
-            status="pass", severity="minor",
-            priority="P2", next_action="proceed",
-            details="Basic PDF structure OK (full check requires Adobe credentials)",
+            gate_id="G4", check_name="pdf_no_validator",
+            status="hard_fail", severity="critical",
+            priority="P0", next_action="block",
+            details=(
+                "No PDF/UA validation tool available (Adobe unavailable, pikepdf "
+                "not installed). pypdf cannot check tag structure, /StructTreeRoot, "
+                "/MarkInfo, or /Lang. Document CANNOT be validated for PDF/UA compliance."
+            ),
         ))
 
     return checks
@@ -714,16 +908,16 @@ def run_gate_g4_verapdf(
     if not client.is_available():
         return GateResult(
             gate_id="G4-VeraPDF",
-            passed=True,
+            passed=False,
             checks=[
                 GateCheck(
                     gate_id="G4-VeraPDF",
                     check_name="verapdf_available",
                     status="soft_fail",
-                    severity="minor",
-                    priority="P2",
-                    next_action="proceed",
-                    details="VeraPDF container not reachable — skipping PDF/UA-1 validation",
+                    severity="moderate",
+                    priority="P1",
+                    next_action="flag_hitl",
+                    details="VeraPDF container not reachable — PDF/UA-1 validation SKIPPED (status: unavailable)",
                 )
             ],
         )
@@ -732,16 +926,16 @@ def run_gate_g4_verapdf(
     if result is None:
         return GateResult(
             gate_id="G4-VeraPDF",
-            passed=True,
+            passed=False,
             checks=[
                 GateCheck(
                     gate_id="G4-VeraPDF",
                     check_name="verapdf_validation",
                     status="soft_fail",
-                    severity="minor",
-                    priority="P2",
-                    next_action="proceed",
-                    details="VeraPDF validation returned no result",
+                    severity="moderate",
+                    priority="P1",
+                    next_action="flag_hitl",
+                    details="VeraPDF validation returned no result — PDF/UA-1 validation SKIPPED (status: unavailable)",
                 )
             ],
         )
@@ -866,8 +1060,24 @@ def is_publishable(gate_results: list[GateResult]) -> tuple[bool, str]:
         (publishable: bool, reason: str)
             publishable=True  → no P0 issues and no unresolved P1 issues
             publishable=False → P0 or P1 issues remain; reason explains which
+
+    Special case: If VeraPDF has a P1 soft_fail due to UNAVAILABILITY (not a
+    real validation failure) AND Adobe G4 explicitly passed, the VeraPDF P1
+    is excluded from the blocking P1 list. Rationale: if Adobe validated
+    successfully, VeraPDF being down should not block publication.
     """
     all_checks = [c for g in gate_results for c in g.checks]
+
+    # Determine if Adobe G4 explicitly passed (has a passing check from Adobe)
+    adobe_g4_passed = any(
+        c.gate_id == "G4"
+        and c.check_name == "adobe_checker_pass"
+        and c.status == "pass"
+        for c in all_checks
+    )
+
+    # VeraPDF unavailability check names — these are NOT real validation failures
+    _VERAPDF_UNAVAIL_NAMES = frozenset({"verapdf_available", "verapdf_validation"})
 
     p0_issues = [
         c for c in all_checks
@@ -877,6 +1087,17 @@ def is_publishable(gate_results: list[GateResult]) -> tuple[bool, str]:
         c for c in all_checks
         if c.priority == "P1" and c.status != "pass"
     ]
+
+    # If Adobe G4 passed, exclude VeraPDF unavailability P1s from blocking list
+    if adobe_g4_passed:
+        p1_issues = [
+            c for c in p1_issues
+            if not (
+                c.gate_id == "G4-VeraPDF"
+                and c.check_name in _VERAPDF_UNAVAIL_NAMES
+                and "unavailable" in c.details.lower()
+            )
+        ]
 
     if p0_issues:
         names = ", ".join(c.check_name for c in p0_issues)

@@ -77,9 +77,8 @@ steps:
         mypy services/ \
           --ignore-missing-imports \
           --python-version 3.11 \
-          --no-error-summary || true
-        # mypy errors are reported but non-blocking during POC phase.
-        # Remove "|| true" to enforce strict typing before production release.
+          --no-error-summary
+        # mypy errors are now blocking. Type errors must be fixed before merge.
     waitFor: ["-"]  # Run immediately, no dependencies
 
   ###############################################################################
@@ -98,9 +97,9 @@ steps:
           --tb=short \
           --cov=services \
           --cov-report=term-missing \
-          --cov-fail-under=70 \
+          --cov-fail-under=80 \
           -q
-        # 70% coverage threshold enforced — matches NFR for POC.
+        # 80% coverage threshold enforced — raised from 70% as intermediate step.
         # Raise to 85% before production release.
     waitFor: ["lint"]
 

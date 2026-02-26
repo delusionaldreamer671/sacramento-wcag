@@ -4,7 +4,6 @@
  * Shows document metadata and links to review if in hitl_review state.
  */
 
-import type { Metadata } from "next";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 import type { DocumentStatus } from "@/lib/types";
@@ -35,14 +34,6 @@ const STATUS_COLORS: Record<DocumentStatus, string> = {
   complete: "bg-green-100 text-green-800 border-green-200",
   failed: "bg-red-100 text-red-800 border-red-200",
 };
-
-export async function generateMetadata({
-  params,
-}: DocumentPageProps): Promise<Metadata> {
-  return {
-    title: `Document ${params.id.slice(0, 8)} — WCAG Remediation Dashboard`,
-  };
-}
 
 async function getDocumentStatus(id: string) {
   const baseUrl =
@@ -218,7 +209,7 @@ export default async function DocumentPage({ params }: DocumentPageProps) {
               "transition-colors",
             )}
           >
-            ← Back to Dashboard
+            &larr; Back to Dashboard
           </Link>
         </div>
       )}

@@ -8,6 +8,8 @@ Schema: IRDocument → IRPage[] → IRBlock[]
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -51,6 +53,17 @@ class RemediationStatus(str, Enum):
     HUMAN_REVIEWED = "human_reviewed"
     APPROVED = "approved"
     FLAGGED = "flagged"
+
+
+class ValidationMode(str, Enum):
+    """Controls how strictly validation gates enforce compliance.
+
+    DRAFT — used during HITL review: axe failures downgraded, only structural
+    P0s (lang, img_alt, img_src) block output.
+    PUBLISH — used for final delivery: full blocking on critical + serious.
+    """
+    DRAFT = "draft"
+    PUBLISH = "publish"
 
 
 # ---------------------------------------------------------------------------
@@ -143,3 +156,52 @@ class IRDocument(BaseModel):
                 "attributes": dict(block.attributes),
             })
         return elements
+
+
+# ---------------------------------------------------------------------------
+# Table deduplication utility
+# ---------------------------------------------------------------------------
+
+
+def _normalize_table_text(text: str) -> str:
+    """Normalize table text for deduplication: lowercase, collapse whitespace."""
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def dedupe_tables_in_page(blocks: list[IRBlock]) -> list[IRBlock]:
+    """Remove duplicate tables within a page based on content hash.
+
+    Adobe Extract sometimes returns the same table twice (e.g. the LRSP
+    "PRIMARY COLLISION FACTOR" table appears back-to-back). This function
+    hashes the normalized text content of each table and skips duplicates
+    that appear on the same page.
+
+    Non-table blocks are always kept.
+    """
+    seen: set[tuple[int, str]] = set()
+    out: list[IRBlock] = []
+
+    for block in blocks:
+        if block.block_type != BlockType.TABLE:
+            out.append(block)
+            continue
+
+        # Build text signature from content + table cell data
+        text_parts = [block.content]
+        headers = block.attributes.get("headers", [])
+        rows = block.attributes.get("rows", [])
+        if headers:
+            text_parts.append(" | ".join(str(h) for h in headers))
+        for row in rows:
+            text_parts.append(" | ".join(str(c) for c in row))
+
+        sig = _normalize_table_text(" ".join(text_parts))
+        h = hashlib.sha256(sig.encode("utf-8")).hexdigest()
+
+        key = (block.page_num, h)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(block)
+
+    return out

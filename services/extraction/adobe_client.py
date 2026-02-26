@@ -13,10 +13,12 @@ up to settings.max_retries attempts.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import io
 import json
 import logging
+import random
 import tempfile
 import time
 import uuid
@@ -150,13 +152,22 @@ def _extract_figures_from_zip(zip_bytes: bytes) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_retryable_status(status_code: int) -> bool:
+    """Return True for HTTP status codes that warrant a retry."""
+    return status_code >= 500 or status_code == 429 or status_code == 0
+
+
 def _with_retry(
     fn: Any,
     max_retries: int,
     backoff_base: float,
     operation_name: str,
 ) -> Any:
-    """Execute *fn()* with exponential backoff on ServiceApiException (5xx).
+    """Execute *fn()* with exponential backoff on retryable errors.
+
+    Retries on:
+      - ServiceApiException with 5xx or 429 status codes
+      - Network-level errors (ConnectionError, Timeout) from requests
 
     Raises the final exception if all retries are exhausted.
     """
@@ -165,9 +176,8 @@ def _with_retry(
         try:
             return fn()
         except ServiceApiException as exc:
-            # Only retry on server-side errors (5xx-equivalent)
             status_code: int = getattr(exc, "status_code", 500) or 500
-            if status_code < 500 and status_code != 0:
+            if not _is_retryable_status(status_code):
                 logger.error(
                     "%s failed with non-retryable status %s: %s",
                     operation_name,
@@ -176,7 +186,8 @@ def _with_retry(
                 )
                 raise
             last_exc = exc
-            wait = backoff_base ** (attempt - 1)
+            wait = backoff_base ** attempt  # exponential: base^1, base^2, ...
+            wait *= 1 + random.uniform(0, 0.1)  # jitter: up to +10%
             logger.warning(
                 "%s attempt %d/%d failed (status=%s). Retrying in %.1fs. Error: %s",
                 operation_name,
@@ -187,6 +198,30 @@ def _with_retry(
                 exc,
             )
             time.sleep(wait)
+        except Exception as exc:
+            # Catch network-level errors (ConnectionError, Timeout, OSError)
+            # from underlying HTTP calls. Only retry transient network issues.
+            exc_type_name = type(exc).__name__
+            if exc_type_name in (
+                "ConnectionError",
+                "Timeout",
+                "ReadTimeout",
+                "ConnectTimeout",
+            ) or isinstance(exc, OSError):
+                last_exc = exc
+                wait = backoff_base ** attempt
+                wait *= 1 + random.uniform(0, 0.1)
+                logger.warning(
+                    "%s attempt %d/%d failed (network: %s). Retrying in %.1fs.",
+                    operation_name,
+                    attempt,
+                    max_retries,
+                    exc_type_name,
+                    wait,
+                )
+                time.sleep(wait)
+            else:
+                raise
 
     assert last_exc is not None
     logger.error("%s failed after %d retries.", operation_name, max_retries)
@@ -346,9 +381,20 @@ class AdobeExtractClient:
         )
 
         location = pdf_services.submit(extract_job)
-        response = pdf_services.get_job_result(
-            location, ExtractPDFResult
-        )
+
+        # CRITICAL-4.1: Wrap get_job_result in a timeout to prevent
+        # indefinite hangs (Cloud Run has a 5-min limit; use 240s).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                pdf_services.get_job_result, location, ExtractPDFResult
+            )
+            try:
+                response = future.result(timeout=240)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"Adobe Extract API get_job_result timed out after 240s "
+                    f"(location={location})"
+                )
 
         result = response.get_result()
 
@@ -393,7 +439,15 @@ class AdobeExtractClient:
     # Persistent cache directory for extraction results.
     # Keyed by SHA-256 of PDF content, so the same file always hits cache
     # regardless of which temp directory it's copied into.
-    _CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".extract_cache"
+    # Cache directory — uses WCAG_EXTRACTION_CACHE_DIR env var if set,
+    # otherwise falls back to project root.  On Cloud Run the project root
+    # is read-only, so the Dockerfile sets the env var to /data/.extract_cache.
+    _CACHE_DIR = Path(
+        __import__("os").environ.get(
+            "WCAG_EXTRACTION_CACHE_DIR",
+            str(Path(__file__).resolve().parent.parent.parent / ".extract_cache"),
+        )
+    )
 
     def extract_pdf_from_path(self, local_pdf: Path) -> dict[str, Any]:
         """Run Adobe Extract API on a local PDF file (no GCS needed).
@@ -429,11 +483,16 @@ class AdobeExtractClient:
 
             # --- Check persistent extraction cache ---
             content_hash = hashlib.sha256(pdf_bytes).hexdigest()
-            self._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_writable = False
+            try:
+                self._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cache_writable = True
+            except OSError:
+                logger.info("Cache dir not writable (%s) — caching disabled, API will still be called.", self._CACHE_DIR)
             cache_path = self._CACHE_DIR / f"{content_hash}_{_CACHE_VERSION}.json"
             figures_cache_path = self._CACHE_DIR / f"{content_hash}_{_CACHE_VERSION}_figures.json"
 
-            cache_enabled = settings.extraction_cache_enabled
+            cache_enabled = settings.extraction_cache_enabled and cache_writable
             if cache_enabled and cache_path.exists():
                 try:
                     cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -613,9 +672,20 @@ class AdobeExtractClient:
         )
 
         location = pdf_services.submit(auto_tag_job)
-        result: AutotagPDFResult = pdf_services.get_job_result(
-            location, AutotagPDFResult
-        )
+
+        # CRITICAL-4.2: Wrap get_job_result in a timeout to prevent
+        # indefinite hangs (Cloud Run has a 5-min limit; use 240s).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                pdf_services.get_job_result, location, AutotagPDFResult
+            )
+            try:
+                result: AutotagPDFResult = future.result(timeout=240)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(
+                    f"Adobe Auto-Tag API get_job_result timed out after 240s "
+                    f"(location={location})"
+                )
 
         # Retrieve the tagged PDF (primary output)
         tagged_pdf_bytes: bytes = b""
@@ -680,11 +750,16 @@ class AdobeExtractClient:
 
             # --- Check persistent cache ---
             content_hash = hashlib.sha256(pdf_bytes).hexdigest()
-            self._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_writable = False
+            try:
+                self._CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cache_writable = True
+            except OSError:
+                logger.info("Cache dir not writable (%s) — auto-tag caching disabled.", self._CACHE_DIR)
             cache_pdf_path = self._CACHE_DIR / f"{content_hash}_{_CACHE_VERSION}_autotag.pdf"
             cache_report_path = self._CACHE_DIR / f"{content_hash}_{_CACHE_VERSION}_autotag_report.json"
 
-            cache_enabled = settings.extraction_cache_enabled
+            cache_enabled = settings.extraction_cache_enabled and cache_writable
             if cache_enabled and cache_pdf_path.exists():
                 try:
                     cached_pdf = cache_pdf_path.read_bytes()

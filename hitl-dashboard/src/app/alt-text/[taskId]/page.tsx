@@ -105,18 +105,25 @@ export default function AltTextReviewPage() {
       .map((p) => p.id);
     if (pendingIds.length === 0) return;
 
+    // Snapshot pre-update state so we can revert on API failure.
+    const previousProposals = proposals;
+
     setSubmitting(true);
+    // Apply optimistic update: mark pending proposals as approved immediately
+    // so the UI feels responsive.
+    setProposals((prev) =>
+      prev.map((p) =>
+        pendingIds.includes(p.id)
+          ? { ...p, status: "approved", reviewer_decision: "approve" }
+          : p,
+      ),
+    );
     try {
       await batchApproveAltText(pendingIds, "reviewer");
-      setProposals((prev) =>
-        prev.map((p) =>
-          pendingIds.includes(p.id)
-            ? { ...p, status: "approved", reviewer_decision: "approve" }
-            : p,
-        ),
-      );
       setActionFeedback(`Approved ${pendingIds.length} proposals`);
     } catch (err) {
+      // API call failed — revert the optimistic update to restore prior state.
+      setProposals(previousProposals);
       setActionFeedback(
         err instanceof Error ? err.message : "Batch approve failed",
       );
@@ -144,10 +151,10 @@ export default function AltTextReviewPage() {
           <p className="mt-1 text-sm text-red-600">{error}</p>
           <button
             type="button"
-            onClick={() => router.push("/upload")}
+            onClick={() => router.back()}
             className="mt-4 rounded-md bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
           >
-            Back to Upload
+            Back to Remediation
           </button>
         </div>
       </div>
@@ -164,10 +171,10 @@ export default function AltTextReviewPage() {
           </p>
           <button
             type="button"
-            onClick={() => router.push("/upload")}
+            onClick={() => router.back()}
             className="mt-4 rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
           >
-            Back to Upload
+            Back to Remediation
           </button>
         </div>
       </div>
@@ -201,10 +208,10 @@ export default function AltTextReviewPage() {
           )}
           <button
             type="button"
-            onClick={() => router.push("/upload")}
+            onClick={() => router.back()}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-gray-50"
           >
-            Back to Upload
+            Back to Remediation
           </button>
         </div>
       </header>
@@ -256,7 +263,7 @@ export default function AltTextReviewPage() {
           submitting={submitting}
           imageUrl={
             current.image_id
-              ? `${process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000"}/api/images/${current.image_id}`
+              ? `${process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000"}/api/v1/images/${current.image_id}`
               : undefined
           }
         />

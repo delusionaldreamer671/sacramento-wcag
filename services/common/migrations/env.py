@@ -33,8 +33,16 @@ def _get_url() -> str:
         # SQLite — convert file path to SQLAlchemy URL
         db_path = settings.db_path or "wcag_pipeline.db"
         return f"sqlite:///{db_path}"
-    except Exception:
-        # Fallback for running alembic CLI outside the app
+    except Exception as exc:
+        # Fallback for running alembic CLI outside the app context.
+        # This warning is important: if settings import fails silently, the wrong
+        # database path may be used, causing migrations to target the wrong DB.
+        logger.warning(
+            "Could not import application settings (reason: %s). "
+            "Falling back to environment variables WCAG_POSTGRES_URL / WCAG_DB_PATH. "
+            "Verify the database path is correct before proceeding.",
+            exc,
+        )
         import os
 
         postgres_url = os.getenv("WCAG_POSTGRES_URL", "")

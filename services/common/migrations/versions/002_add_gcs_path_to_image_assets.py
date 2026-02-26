@@ -9,7 +9,11 @@ Create Date: 2026-02-26
 """
 from __future__ import annotations
 
+import logging
+
 from alembic import op
+
+logger = logging.getLogger(__name__)
 
 revision: str = "002"
 down_revision: str | None = "001"
@@ -20,14 +24,24 @@ depends_on: str | None = None
 def upgrade() -> None:
     dialect = op.get_bind().dialect.name
     # SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN,
-    # so we catch the error if the column already exists.
+    # so we catch the specific "duplicate column" error and ignore it.
+    # All other errors are re-raised so migration failures are visible.
     try:
         op.execute(
             "ALTER TABLE image_assets ADD COLUMN gcs_path TEXT DEFAULT NULL"
         )
-    except Exception:
-        # Column already exists — safe to continue
-        pass
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if "duplicate column" in exc_str or "already exists" in exc_str:
+            # Column already exists — safe to continue
+            logger.info(
+                "Migration 002: gcs_path column already exists in image_assets — skipping ADD COLUMN"
+            )
+        else:
+            logger.warning(
+                "Migration 002: unexpected error adding gcs_path column: %s", exc
+            )
+            raise
 
 
 def downgrade() -> None:

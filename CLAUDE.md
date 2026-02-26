@@ -418,18 +418,36 @@ gcloud run deploy sacto-wcag-api \
 # gcloud run deploy ... --set-env-vars="PYTHONUNBUFFERED=1"
 ```
 
-**Post-deploy verification** (run ALL three):
+**Post-deploy verification — MANDATORY, NO EXCEPTIONS:**
 ```bash
-# 1. Verify env vars survived
+# Default run (cheap — 1-page canary PDF, ~2 server-side API calls):
+python scripts/verify_deploy.py --revision <REVISION>
+
+# ALL checks must pass. Do NOT claim deployment is successful until this outputs:
+# VERDICT: ALL CHECKS PASSED (51/51 passed)
+
+# Full run (adds image PDF for Vertex AI e2e):
+python scripts/verify_deploy.py --revision <REVISION> --with-image-pdf
+
+# Cheap run (health + env + CORS only — zero external API cost):
+python scripts/verify_deploy.py --skip-paid-apis
+```
+
+The script tests 8 categories (51+ checks, cost-capped at 5 external API calls):
+1. **Health** — all 5 dependency probes return expected status
+2. **Env vars** — all 10 required env vars present on the revision
+3. **Analyze contract** — 200 response, task_id, 50 rules, pipeline_metadata with 3 stages, work metrics
+4. **Remediate contract** — 200 response, X-Task-Id, X-Pipeline-Metadata, X-Remediation-Delta, lang="en", title, skip-link
+5. **Vertex AI e2e** — (optional) real image PDF → verify AI actually generates alt text
+6. **CORS headers** — all 4 custom headers exposed (X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta)
+7. **Silent fallback detection** — Vertex AI probe reports auth method, no silent passes
+8. **Gate semantic truth** — stages with status "success" have evidence of actual work; degraded/skipped stages have explanations
+
+**Legacy manual checks** (only if the script is unavailable):
+```bash
 gcloud run revisions describe <REVISION> --region us-central1 \
   --format='yaml(spec.containers[0].env[].name)'
-# Must show all 10 env vars listed above
-
-# 2. Health check
 curl https://sacto-wcag-api-738802459862.us-central1.run.app/api/health
-
-# 3. Smoke test — analyze a small PDF and check for 50-rule audit
-# Response must include rules_checked=50 in summary
 ```
 
 ### Frontend (Vercel)
@@ -460,3 +478,38 @@ npx vercel ls --prod
 | Vercel build cache serves old code | UI shows stale components | Use `--force` flag on deploy |
 | Missing `PYTHONPATH=/app` | Module imports fail in container | Include in env vars; verify after deploy |
 | `PYTHONPATH` set to local Windows path | Imports break in Linux container | Must be `/app`, not `C:/Program Files/...` |
+| Credential check mismatch (availability vs usage) | Tool reports "available" but silently falls back per-call | Both the availability check AND the per-call function must use the same credential sources (ADC, K_SERVICE, GOOGLE_APPLICATION_CREDENTIALS) |
+| Silent fallback returns | Function returns fallback value instead of raising → pipeline reports "success" for zero work | Use `StageNoOpError` in pipeline stages; check work metrics (ai_succeeded > 0) not just status |
+| Unit tests pass but production fails | Mocking dependencies hides integration bugs | Run `scripts/verify_deploy.py` after every deploy — tests real HTTP endpoints |
+| Test PDFs without extractable text | Scanned-PDF guard rejects blank test PDFs → 422 | Use reportlab to generate PDFs with actual text content |
+| Redundant imports inside try blocks | Python scoping: `from X import Y` inside a block shadows module-level import | Never re-import at module level; use the existing import |
+| Gate fail-open: validation tool unavailable = PASS | axe-core/Adobe/VeraPDF unavailable → gate reports pass → false compliance claim | All gate unavailability returns soft_fail/P1/flag_hitl, never P2/proceed |
+| `except Exception: pass` on validation | VeraPDF error during fix acceptance → fix silently accepted without validation | Reject the fix when validation fails; unvalidated changes are worse than no changes |
+| Regression gate silently skipped | VeraPDF unavailable → regression gate skipped → no log → output compliance unverified | Log WARNING + set span attribute when regression gate is skipped |
+| CORS only on actual responses | CORS `Access-Control-Expose-Headers` appears on real responses, NOT OPTIONS preflight | Test with GET+Origin header, not OPTIONS |
+
+### Mandatory Post-Change Process
+
+**EVERY code change must follow this sequence. No exceptions.**
+
+1. `python -m pytest tests/ -x -q` — all tests pass (currently 625+)
+2. Deploy: `gcloud run deploy ...` with `--update-env-vars`
+3. `python scripts/verify_deploy.py --revision <REVISION>` — 51/51 pass
+4. Update `.claude/session-handoff.md` with: revision, changes, verification evidence
+5. Only THEN state "deployment successful"
+
+**A change is NOT verified until `verify_deploy.py` passes.** Unit tests alone are insufficient.
+
+### Session Handoff (Compaction Recovery)
+
+After every deploy, update `.claude/session-handoff.md` with:
+- Cloud Run service + revision + region
+- Git commit SHA
+- Env var state (verified via verify_deploy.py)
+- Changes made and why
+- Known invariants (rules that must NEVER be violated)
+- Backlog progress
+- Verification evidence (paste verify_deploy.py result)
+- Next steps in priority order
+
+On session start (or after compaction), read `.claude/session-handoff.md` + `scripts/verify_deploy_report.json` to resume.

@@ -71,7 +71,9 @@ def get_page_count(pdf_path: Path) -> int:
         with pikepdf.open(str(pdf_path)) as pdf:
             return len(pdf.pages)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("get_page_count: failed to open %s: %s", pdf_path, exc)
+        # LOW-2.30: Promote to WARNING — silent fallback to 0 could cause callers
+        # to skip chunking for an oversized PDF that simply could not be opened.
+        logger.warning("get_page_count: failed to open '%s': %s — returning 0", pdf_path, exc)
         return 0
 
 
@@ -93,7 +95,12 @@ def needs_chunking(pdf_path: Path, max_pages: int = 250) -> bool:
             )
         return result
     except Exception as exc:  # noqa: BLE001
-        logger.debug("needs_chunking: error checking %s: %s", pdf_path, exc)
+        # LOW-2.31: Promote to WARNING — silent False return means oversized PDFs
+        # could bypass chunking if pikepdf raises unexpectedly.
+        logger.warning(
+            "needs_chunking: error checking '%s': %s — defaulting to False (no chunking)",
+            pdf_path, exc,
+        )
         return False
 
 
@@ -119,6 +126,13 @@ def chunk_pdf(
     try:
         import pikepdf
     except ImportError:
+        # LOW-2.32: Log warning — silent [] return would cause caller to skip
+        # chunking without any indication of why.
+        logger.warning(
+            "chunk_pdf: pikepdf ImportError inside chunk_pdf body — cannot chunk '%s'. "
+            "This should not occur if the pikepdf guard at module load succeeded.",
+            pdf_path,
+        )
         return []
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="wcag_chunks_"))

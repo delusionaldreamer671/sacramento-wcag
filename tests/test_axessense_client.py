@@ -57,6 +57,24 @@ class TestIsAvailable:
         assert client.is_available() is False
 
     @patch("services.common.axessense_client.httpx.get")
+    def test_returns_false_on_401_unauthorized(self, mock_get):
+        """MEDIUM-4.13: HTTP 401 means invalid API key — service not usable."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_get.return_value = mock_resp
+        client = AxesSenseClient(base_url="https://api.example.com", api_key="key")
+        assert client.is_available() is False
+
+    @patch("services.common.axessense_client.httpx.get")
+    def test_returns_false_on_404(self, mock_get):
+        """MEDIUM-4.13: HTTP 404 means endpoint not found — service not properly configured."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+        client = AxesSenseClient(base_url="https://api.example.com", api_key="key")
+        assert client.is_available() is False
+
+    @patch("services.common.axessense_client.httpx.get")
     def test_returns_false_on_connection_error(self, mock_get):
         import httpx
         mock_get.side_effect = httpx.ConnectError("refused")

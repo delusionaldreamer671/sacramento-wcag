@@ -6,6 +6,7 @@ Provides graceful degradation when the container is not running.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -49,13 +50,17 @@ class VeraPDFClient:
         self._timeout = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
     def is_available(self) -> bool:
-        """Check if VeraPDF container is reachable."""
+        """Check if VeraPDF container is reachable and healthy.
+
+        MEDIUM-4.14: Check for HTTP 200 specifically, not just < 500.
+        A 404 on /api/info means the container is not properly configured.
+        """
         try:
             resp = httpx.get(
                 f"{self._base_url}/api/info",
                 timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0),
             )
-            return resp.status_code < 500
+            return resp.status_code == 200
         except (httpx.ConnectError, httpx.TimeoutException, OSError):
             logger.debug("VeraPDF not reachable at %s", self._base_url)
             return False
@@ -64,27 +69,60 @@ class VeraPDFClient:
         """Validate PDF against PDF/UA-1 profile.
 
         Returns None if the container is unavailable or validation fails.
+
+        HIGH-4.11: Retries 5xx responses (up to 2 retries, 2s backoff).
+        Distinguishes 4xx (permanent, no retry) from 5xx (transient, retry).
         """
-        try:
-            resp = httpx.post(
-                f"{self._base_url}/api/validate/ua1",
-                content=pdf_bytes,
-                headers={"Content-Type": "application/pdf"},
-                timeout=self._timeout,
-            )
-            if resp.status_code != 200:
+        max_retries = 2
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_retries + 2):
+            try:
+                resp = httpx.post(
+                    f"{self._base_url}/api/validate/ua1",
+                    content=pdf_bytes,
+                    headers={"Content-Type": "application/pdf"},
+                    timeout=self._timeout,
+                )
+                if resp.status_code == 200:
+                    return self._parse_response(resp.json())
+
+                # 5xx: transient server error — retry
+                if resp.status_code >= 500 and attempt <= max_retries:
+                    logger.warning(
+                        "VeraPDF returned HTTP %d (attempt %d/%d). "
+                        "Retrying in %.1fs.",
+                        resp.status_code, attempt, max_retries + 1,
+                        2.0 * attempt,
+                    )
+                    time.sleep(2.0 * attempt)
+                    continue
+
+                # 4xx or final 5xx: permanent or exhausted retries
                 logger.warning(
                     "VeraPDF returned HTTP %d: %s",
                     resp.status_code, resp.text[:200],
                 )
                 return None
-            return self._parse_response(resp.json())
-        except (httpx.ConnectError, httpx.TimeoutException, OSError) as exc:
-            logger.debug("VeraPDF unavailable: %s", exc)
-            return None
-        except Exception as exc:
-            logger.warning("VeraPDF validation error: %s", exc)
-            return None
+
+            except (httpx.ConnectError, httpx.TimeoutException, OSError) as exc:
+                last_exc = exc
+                if attempt <= max_retries:
+                    logger.warning(
+                        "VeraPDF connection failed (attempt %d/%d): %s. "
+                        "Retrying in %.1fs.",
+                        attempt, max_retries + 1, exc, 2.0 * attempt,
+                    )
+                    time.sleep(2.0 * attempt)
+                    continue
+                logger.debug("VeraPDF unavailable after retries: %s", exc)
+                return None
+            except Exception as exc:
+                logger.warning("VeraPDF validation error: %s", exc)
+                return None
+
+        # Should not reach here, but be safe
+        return None
 
     def _parse_response(self, data: dict) -> VeraPDFResult:
         """Parse VeraPDF JSON response into VeraPDFResult."""

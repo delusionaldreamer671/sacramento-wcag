@@ -38,6 +38,16 @@ variable "container_image_tag" {
   description = "Docker image tag to deploy across all Cloud Run services. Typically a git commit SHA or semver tag. Defaults to 'latest' for local dev — always pin explicitly in staging/prod."
   type        = string
   default     = "latest"
+
+  validation {
+    # Prevent "latest" in staging and prod to ensure reproducible deployments.
+    # In dev, "latest" is acceptable for rapid iteration.
+    # This check is evaluated against the variable value alone and cannot reference
+    # var.environment directly; enforce at the CI/CD level for staging/prod pipelines.
+    # Minimum safeguard: reject an empty tag (which would silently pull wrong image).
+    condition     = length(var.container_image_tag) > 0
+    error_message = "container_image_tag must not be empty. Use a git SHA or semver tag for staging/prod; 'latest' is only acceptable for local dev."
+  }
 }
 
 variable "gcs_location" {

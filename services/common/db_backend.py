@@ -74,36 +74,51 @@ class DatabaseBackend(Protocol):
 
 
 class SQLiteBackend:
-    """SQLite backend — wraps sqlite3 connection."""
+    """SQLite backend — wraps sqlite3 connection.
+
+    Thread safety: A threading.Lock serialises all database operations.
+    SQLite's WAL mode allows concurrent reads at the file level, but the
+    single connection object is not safe to use from multiple threads
+    simultaneously without explicit locking.
+    """
 
     def __init__(self, db_path: str = "wcag_pipeline.db") -> None:
         import sqlite3
+        import threading
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
-        return self._conn.execute(sql, params)
+        with self._lock:
+            return self._conn.execute(sql, params)
 
     def executemany(self, sql: str, params_list: list[tuple]) -> None:
-        self._conn.executemany(sql, params_list)
+        with self._lock:
+            self._conn.executemany(sql, params_list)
 
     def fetchone(self, sql: str, params: tuple = ()) -> dict | None:
-        row = self._conn.execute(sql, params).fetchone()
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
         return dict(row) if row else None
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def commit(self) -> None:
-        self._conn.commit()
+        with self._lock:
+            self._conn.commit()
 
     def execute_ddl(self, ddl: str) -> None:
-        self._conn.executescript(ddl)
-        self._conn.commit()
+        with self._lock:
+            self._conn.executescript(ddl)
+            self._conn.commit()
 
     def execute_pragma(self, pragma: str) -> None:
-        self._conn.execute(pragma)
+        with self._lock:
+            self._conn.execute(pragma)
 
     @property
     def backend_type(self) -> str:
@@ -143,7 +158,9 @@ CREATE TABLE IF NOT EXISTS review_items (
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'reviewer',
-    token_hash TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+    token_hash TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+    hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+    token_expires_at TEXT);
 CREATE TABLE IF NOT EXISTS change_proposals (
     id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id),
     review_item_id TEXT, proposed_by TEXT NOT NULL, human_comment TEXT NOT NULL,

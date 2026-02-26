@@ -37,6 +37,9 @@ def get_current_trace_id() -> str:
         ctx = span.get_span_context()
         if ctx and ctx.trace_id:
             return format(ctx.trace_id, "032x")
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 — do not catch SystemExit/KeyboardInterrupt
+        import logging
+        logging.getLogger(__name__).debug(
+            "get_current_trace_id: failed to extract trace ID", exc_info=True
+        )
     return ""

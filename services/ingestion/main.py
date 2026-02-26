@@ -112,7 +112,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Task-Id", "X-Pipeline-Version"],
+    expose_headers=["X-Task-Id", "X-Pipeline-Version", "X-Pipeline-Metadata", "X-Remediation-Delta"],
 )
 
 
@@ -231,31 +231,12 @@ def health_check() -> PipelineHealthResponse:
     Cloud Run uses this endpoint for startup and liveness probes.
     ``/api/v1/health``, ``/api/health``, and ``/health`` are all supported.
     """
-    from services.common.database import get_db
+    from services.common.dependency_probes import run_all_probes, probes_to_health_response
 
-    services_status: dict[str, str] = {"ingestion": "up"}
+    results = run_all_probes()
+    health = probes_to_health_response(results)
 
-    # Check database connectivity
-    try:
-        db = get_db(settings.db_path)
-        db._backend.fetchone("SELECT 1", ())
-        services_status["database"] = "up"
-    except Exception:
-        services_status["database"] = "down"
-
-    # Check required config
-    services_status["adobe_credentials"] = (
-        "configured" if settings.adobe_client_id else "missing"
-    )
-    services_status["vertex_ai"] = (
-        "configured" if settings.gcp_project_id else "missing"
-    )
-
-    # Determine overall status
-    critical_down = services_status.get("database") == "down"
-    overall = "degraded" if critical_down else "healthy"
-
-    return PipelineHealthResponse(status=overall, services=services_status)
+    return PipelineHealthResponse(status=health["status"], services=health["services"])
 
 
 @app.get(
@@ -313,6 +294,19 @@ async def on_startup() -> None:
     init_telemetry(app)
     # Initialize the semaphore at startup (must be in an async context)
     get_pipeline_semaphore()
+    # Run dependency probes at startup and log results
+    from services.common.dependency_probes import run_all_probes
+    probe_results = run_all_probes()
+    for r in probe_results:
+        level = logging.ERROR if r.status == "down" and r.required else (
+            logging.WARNING if r.status == "down" else logging.INFO
+        )
+        logger.log(
+            level,
+            "Dependency probe [%s]: status=%s latency=%.1fms%s",
+            r.name, r.status, r.latency_ms,
+            f" ({r.message})" if r.message else "",
+        )
     logger.info("Ingestion service starting up")
 
 

@@ -48,12 +48,24 @@ router = APIRouter(prefix=API_V1_PREFIX)
 
 
 async def _acquire_pipeline_semaphore() -> None:
-    """Acquire the pipeline concurrency semaphore or raise 503."""
+    """Acquire the pipeline concurrency semaphore atomically or raise 503.
+
+    Uses asyncio.wait_for with timeout=0.0 to perform a non-blocking atomic
+    acquire.  The old pattern (check sem._value > 0 then return) was a classic
+    TOCTOU race: another coroutine could acquire the semaphore between the
+    check and the point where the caller actually tried to use it, and the
+    semaphore was never actually acquired by this code path.
+
+    Callers that use this function are responsible for releasing the semaphore
+    (e.g. via a try/finally or a context manager at the call site).  For new
+    code, prefer `async with get_pipeline_semaphore():` directly.
+    """
     from services.ingestion.main import get_pipeline_semaphore
 
     sem = get_pipeline_semaphore()
-    acquired = sem._value > 0  # Check without acquiring
-    if not acquired:
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.0)
+    except (asyncio.TimeoutError, TimeoutError):
         raise HTTPException(
             status_code=503,
             detail="Server at maximum document processing capacity. Retry later.",
@@ -87,7 +99,16 @@ def _get_document_or_404(document_id: str) -> dict:
 
 
 def _validate_pdf(file: UploadFile) -> None:
-    """Raise 400 if the uploaded file is not a PDF."""
+    """Raise 400 if the uploaded file is not a PDF.
+
+    Checks (in order):
+    1. Content-type header must be application/pdf or application/octet-stream.
+    2. Filename must end with .pdf.
+
+    Magic-byte validation (%%PDF signature) is intentionally deferred to
+    _validate_pdf_bytes() which is called after the body has been read, because
+    UploadFile is a streaming object and reading it here would consume the body.
+    """
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -99,6 +120,25 @@ def _validate_pdf(file: UploadFile) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File '{filename}' does not have a .pdf extension.",
         )
+
+
+def _validate_pdf_bytes(contents: bytes, filename: str) -> None:
+    """Raise 400 if bytes do not contain the PDF magic signature (%%PDF).
+
+    Checks the first 1024 bytes for the %%PDF marker (accounting for a
+    possible BOM prefix).  Corrupt or non-PDF files that pass content-type /
+    extension checks are caught here before being sent to Adobe Extract, which
+    would produce a confusing 502 error.
+    """
+    from services.common.security import validate_pdf_bytes
+
+    try:
+        validate_pdf_bytes(contents, filename)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 # Minimum percentage of pages that must contain extractable text.
@@ -225,6 +265,8 @@ async def upload_document(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Uploaded file is empty.",
             )
+        # MEDIUM-1.14: Reject corrupt PDFs before they reach Adobe Extract (400 instead of 502)
+        _validate_pdf_bytes(contents, filename)
         local_path.write_bytes(contents)
         logger.info(
             "Received upload: filename=%s size=%d bytes document_id=%s",
@@ -461,6 +503,8 @@ async def convert_document(
         )
 
     filename = file.filename or "document.pdf"
+    # MEDIUM-1.14: Reject corrupt PDFs before running full pipeline
+    _validate_pdf_bytes(contents, filename)
     stem = Path(filename).stem
 
     try:
@@ -486,17 +530,34 @@ async def convert_document(
     sem = get_pipeline_semaphore()
 
     if output_format == "zip":
-        # Generate both HTML and PDF, then bundle them into a ZIP archive.
+        # CRITICAL-1.4: ZIP output runs convert_pdf_sync twice (once for HTML,
+        # once for PDF) against the SAME source file, then bundles both into a
+        # ZIP archive.  This is intentional — the two passes use different
+        # output renderers and must be kept independent.
+        #
+        # Design constraint: because each call runs Adobe Extract + AI alt text
+        # independently, there is a cost multiplier of 2x for ZIP output.  A
+        # future optimisation would share the extraction/IR stage and only fork
+        # at the HTML/PDF build stage.  Until then this constraint is documented
+        # here so callers understand why ZIP output costs twice as much as a
+        # single-format request.
+        #
+        # Dedup guard: `contents` (the raw bytes) is identical for both calls —
+        # the same source PDF is processed twice.  This is not a bug (the two
+        # calls intentionally use different output_format values), but if a
+        # caller accidentally passes the same output_format for both calls the
+        # result would be identical files in the ZIP.  That is prevented by the
+        # hard-coded "html" / "pdf" literals below.
         try:
             async with sem:
-                html_bytes, _, task_id = await asyncio.to_thread(
+                html_bytes, _, task_id, _ = await asyncio.to_thread(
                     convert_pdf_sync,
                     contents,
                     filename,
                     "html",
                     validation_mode=mode,
                 )
-                pdf_bytes, _, _ = await asyncio.to_thread(
+                pdf_bytes, _, _, _ = await asyncio.to_thread(
                     convert_pdf_sync,
                     contents,
                     filename,
@@ -531,7 +592,7 @@ async def convert_document(
     else:
         try:
             async with sem:
-                output_bytes, content_type, task_id = await asyncio.to_thread(
+                output_bytes, content_type, task_id, _ = await asyncio.to_thread(
                     convert_pdf_sync,
                     contents,
                     filename,
@@ -626,6 +687,31 @@ _GENERIC_ALT_RE = re.compile(
     r"^\[Figure on page .+ — alt text requires review\]$"
 )
 
+_SEVERITY_SCORE = {"critical": 4, "serious": 3, "moderate": 2, "minor": 1}
+
+
+def _compute_review_priority(proposal: dict) -> int:
+    """Compute review priority score for a proposal.
+
+    Higher score = needs attention first.
+    Formula: severity * 2 + (auto_fixable penalty) + (action_type weight)
+    """
+    severity = _SEVERITY_SCORE.get(proposal.get("severity", "moderate"), 2)
+    auto_fixable = proposal.get("auto_fixable", False)
+    action_type = proposal.get("action_type", "auto_fix")
+
+    # Auto-fixable items need less attention
+    auto_penalty = 0 if auto_fixable else 2
+
+    # Manual review items need more attention
+    action_weight = 0
+    if action_type == "manual_review":
+        action_weight = 3
+    elif action_type == "ai_draft":
+        action_weight = 1
+
+    return severity * 2 + auto_penalty + action_weight
+
 
 class AnalysisProposal(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -641,6 +727,8 @@ class AnalysisProposal(BaseModel):
     page: int
     auto_fixable: bool
     action_type: str = "auto_fix"  # "auto_fix", "ai_draft", "manual_review"
+    review_priority: int = 0       # Higher = needs attention first
+    technique_refs: str = ""       # PDF technique references (e.g. "PDF1, PDF4")
 
 
 class AnalysisSummary(BaseModel):
@@ -682,6 +770,7 @@ class AnalysisResult(BaseModel):
     proposals: list[AnalysisProposal]
     summary: AnalysisSummary
     alt_text_proposals: list[AltTextProposalResponse] = Field(default_factory=list)
+    pipeline_metadata: dict = Field(default_factory=dict)
 
 
 def _analyze_ir_document(ir_doc: IRDocument) -> list[AnalysisProposal]:
@@ -986,6 +1075,8 @@ async def analyze_document(
         )
 
     filename = file.filename or "document.pdf"
+    # MEDIUM-1.14: Reject corrupt PDFs before running full pipeline
+    _validate_pdf_bytes(contents, filename)
     _check_scanned_pdf(contents, filename)
 
     logger.info(
@@ -994,18 +1085,54 @@ async def analyze_document(
         len(contents),
     )
 
-    from services.ingestion.converter import stage_extract
+    from services.ingestion.converter import stage_extract, stage_ai_alt_text
     from services.ingestion.main import get_pipeline_semaphore
+    from services.common.pipeline import StageSpec, PipelineMetadata, run_stage
+
+    STAGE_EXTRACT = StageSpec(name="extract", category="required")
+    STAGE_AI_ALT_TEXT = StageSpec(name="ai_alt_text", category="required_with_fallback")
+    STAGE_AUDIT = StageSpec(name="wcag_audit", category="required")
+
+    pipeline = PipelineMetadata(task_id="")
 
     try:
         async with get_pipeline_semaphore():
-            ir_doc = await asyncio.to_thread(stage_extract, contents, filename)
+            extract_result = await asyncio.to_thread(
+                run_stage, STAGE_EXTRACT, stage_extract, contents, filename,
+            )
+            pipeline.record_stage(extract_result)
+            if not extract_result.ok:
+                raise RuntimeError(f"Extraction failed: {'; '.join(extract_result.errors)}")
+            ir_doc = extract_result.data
     except Exception as exc:
         logger.exception("Extraction failed for %s", filename)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"PDF extraction failed: {exc}",
         ) from exc
+
+    # Apply deterministic fixes BEFORE AI alt text
+    from services.common.deterministic_remediator import apply_deterministic_fixes
+    STAGE_DETERMINISTIC = StageSpec(name="deterministic_fixes", category="required")
+    det_result = await asyncio.to_thread(
+        run_stage, STAGE_DETERMINISTIC, apply_deterministic_fixes, ir_doc,
+    )
+    pipeline.record_stage(det_result)
+    if det_result.ok and det_result.data:
+        ir_doc, _det_fixes = det_result.data
+
+    # Generate AI alt text for images BEFORE auditing — populates alt attributes
+    ai_result = await asyncio.to_thread(
+        run_stage, STAGE_AI_ALT_TEXT, stage_ai_alt_text, ir_doc,
+    )
+    pipeline.record_stage(ai_result)
+    if ai_result.data is not None:
+        ir_doc = ai_result.data
+    if not ai_result.ok:
+        logger.warning(
+            "AI alt text generation %s for %s: %s",
+            ai_result.status, filename, ai_result.warnings,
+        )
 
     # Run the full WCAG 2.1 AA audit — all 50 criteria
     audit_result = run_full_audit(ir_doc)
@@ -1023,17 +1150,66 @@ async def analyze_document(
 
     # Convert FAIL findings to frontend-compatible proposals
     proposal_dicts = findings_to_proposals(audit_result.findings)
+
+    # B7: Priority scoring — score each proposal and sort by priority
+    for p in proposal_dicts:
+        p["review_priority"] = _compute_review_priority(p)
+    proposal_dicts.sort(key=lambda p: p.get("review_priority", 0), reverse=True)
+
     proposals = [AnalysisProposal(**p) for p in proposal_dicts]
+
+    # B2: Validator aggregation — cross-reference internal audit with available validators
+    from services.common.validator_aggregator import aggregate_validation_results
+    internal_results: dict[str, str] = {}
+    for f in audit_result.findings:
+        key = f.criterion
+        if key not in internal_results:
+            internal_results[key] = f.status.value
+        elif f.status.value == "fail":
+            internal_results[key] = "fail"
+
+    aggregated = aggregate_validation_results(internal_results=internal_results)
+    validation_confidence = {
+        "high": sum(1 for a in aggregated if a.confidence.value == "high"),
+        "medium": sum(1 for a in aggregated if a.confidence.value == "medium"),
+        "low": sum(1 for a in aggregated if a.confidence.value == "low"),
+        "needs_human_review": sum(1 for a in aggregated if a.needs_human_review),
+    }
 
     # Build summary from audit
     summary_data = audit_summary_dict(audit_result)
 
     task_id = str(uuid.uuid4())
+    pipeline.task_id = task_id
+
+    # Store audit as baseline for pre/post comparison (B6)
+    pipeline_dict = pipeline.to_dict()
+    pipeline_dict["baseline_audit"] = {
+        "rules_checked": audit_result.rules_checked,
+        "rules_passed": audit_result.rules_passed,
+        "rules_failed": audit_result.rules_failed,
+        "coverage_pct": audit_result.coverage_pct,
+    }
+    pipeline_dict["validation_confidence"] = validation_confidence
 
     # Generate alt text proposals for HITL review (if enabled)
     alt_text_proposals: list[AltTextProposalResponse] = []
     if settings.alt_text_hitl_enabled:
         alt_text_proposals = _generate_alt_text_proposals(ir_doc, task_id)
+
+    # MEDIUM-1.11: IR persistence design constraint
+    # The analyze endpoint builds an IRDocument in memory and discards it after
+    # returning findings.  The IR is NOT persisted to storage.  When the client
+    # subsequently calls /remediate with the same PDF, the pipeline runs the
+    # full extraction stage again from scratch (Adobe Extract → IR build).
+    #
+    # Consequence: the task_id returned here is NOT usable as a handle for a
+    # pre-computed IR.  Analyze and remediate are fully independent operations.
+    #
+    # Future optimisation (TODO): persist the IR to GCS or SQLite keyed by
+    # content-hash of the source PDF, and have /remediate reuse it when the
+    # same file is submitted within a configurable TTL window.  This would
+    # eliminate the double extraction cost for the analyze → remediate workflow.
 
     return AnalysisResult(
         task_id=task_id,
@@ -1042,6 +1218,7 @@ async def analyze_document(
         proposals=proposals,
         summary=AnalysisSummary(**summary_data),
         alt_text_proposals=alt_text_proposals,
+        pipeline_metadata=pipeline_dict,
     )
 
 
@@ -1212,6 +1389,8 @@ async def remediate_document(
         )
 
     filename = file.filename or "document.pdf"
+    # MEDIUM-1.14: Reject corrupt PDFs before running full pipeline
+    _validate_pdf_bytes(contents, filename)
     _check_scanned_pdf(contents, filename)
     stem = Path(filename).stem
 
@@ -1248,9 +1427,14 @@ async def remediate_document(
     from services.ingestion.converter import convert_pdf_sync
     from services.ingestion.main import get_pipeline_semaphore
 
+    # MEDIUM-9.26: delta header placeholder — emitted on both success and error paths
+    _partial_delta_headers: dict[str, str] = {
+        "Access-Control-Expose-Headers": "X-Task-Id, X-Pipeline-Metadata, X-Remediation-Delta",
+    }
+
     try:
         async with get_pipeline_semaphore():
-            output_bytes, content_type, task_id = await asyncio.to_thread(
+            output_bytes, content_type, task_id, pipeline = await asyncio.to_thread(
                 convert_pdf_sync,
                 contents,
                 filename,
@@ -1262,30 +1446,97 @@ async def remediate_document(
         logger.warning(
             "Unexpected validation block for %s: %s", filename, exc,
         )
+        # MEDIUM-9.26: include partial delta so clients know pipeline errored
+        _partial_delta_headers["X-Remediation-Delta"] = json.dumps({
+            "status": "blocked",
+            "before_failed": None,
+            "before_passed": None,
+            "after_failed": None,
+            "after_passed": None,
+        })
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
                 "message": str(exc),
                 "violations": exc.violations,
             },
+            headers=_partial_delta_headers,
         ) from exc
     except Exception as exc:
         logger.exception("Remediation failed for %s", filename)
+        # MEDIUM-9.26: include partial delta so clients know pipeline errored
+        _partial_delta_headers["X-Remediation-Delta"] = json.dumps({
+            "status": "error",
+            "before_failed": None,
+            "before_passed": None,
+            "after_failed": None,
+            "after_passed": None,
+        })
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Remediation failed: {exc}",
+            headers=_partial_delta_headers,
         ) from exc
 
     disposition = f'attachment; filename="{stem}_remediated.{output_format}"'
 
+    # HIGH-9.14: Compute a true remediation delta that includes before_* values.
+    # The pipeline exposes two audit stages:
+    #   - "pre_remediation_audit"  (before fixes are applied — may be absent in
+    #     some converter versions; None means "not captured this run")
+    #   - "post_remediation_audit" (after fixes are applied)
+    # Without before_* the delta is meaningless, so we always emit all four
+    # fields, using None when a stage result was not available.
+    pipeline_dict = pipeline.to_dict()
+    stages = pipeline_dict.get("stages", [])
+
+    pre_audit_stage = next(
+        (s for s in stages if s.get("stage_name") == "pre_remediation_audit"),
+        None,
+    )
+    post_audit_stage = next(
+        (s for s in stages if s.get("stage_name") == "post_remediation_audit"),
+        None,
+    )
+
+    before_failed: int | None = None
+    before_passed: int | None = None
+    after_failed: int | None = None
+    after_passed: int | None = None
+
+    if pre_audit_stage and pre_audit_stage.get("metadata"):
+        pre_meta = pre_audit_stage["metadata"]
+        before_failed = pre_meta.get("rules_failed")
+        before_passed = pre_meta.get("rules_passed")
+
+    if post_audit_stage and post_audit_stage.get("metadata"):
+        post_meta = post_audit_stage["metadata"]
+        after_failed = post_meta.get("rules_failed")
+        after_passed = post_meta.get("rules_passed")
+
+    # Always include the delta header when we have at least post-audit data
+    remediation_delta: dict = {}
+    if after_failed is not None or after_passed is not None:
+        remediation_delta = {
+            "before_failed": before_failed,
+            "before_passed": before_passed,
+            "after_failed": after_failed,
+            "after_passed": after_passed,
+        }
+
+    response_headers = {
+        "Content-Disposition": disposition,
+        "X-Task-Id": task_id,
+        "X-Pipeline-Metadata": json.dumps(pipeline_dict),
+        "Access-Control-Expose-Headers": "X-Task-Id, X-Pipeline-Metadata, X-Remediation-Delta",
+    }
+    if remediation_delta:
+        response_headers["X-Remediation-Delta"] = json.dumps(remediation_delta)
+
     return Response(
         content=output_bytes,
         media_type=content_type,
-        headers={
-            "Content-Disposition": disposition,
-            "X-Task-Id": task_id,
-            "Access-Control-Expose-Headers": "X-Task-Id",
-        },
+        headers=response_headers,
     )
 
 

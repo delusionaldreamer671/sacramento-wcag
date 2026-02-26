@@ -1,0 +1,317 @@
+{
+  "url": "https://sacto-wcag-api-738802459862.us-central1.run.app",
+  "timestamp": "2026-02-26T11:18:14Z",
+  "revision": "sacto-wcag-api-00034-vfn",
+  "all_passed": true,
+  "total": 51,
+  "passed": 51,
+  "failed": 0,
+  "checks": [
+    {
+      "name": "Health endpoint returns 200",
+      "passed": true,
+      "detail": "Got 200",
+      "category": "health"
+    },
+    {
+      "name": "Database probe: up",
+      "passed": true,
+      "detail": "status=up",
+      "category": "health"
+    },
+    {
+      "name": "Adobe credentials probe: up",
+      "passed": true,
+      "detail": "status=up",
+      "category": "health"
+    },
+    {
+      "name": "Vertex AI probe: up",
+      "passed": true,
+      "detail": "status=up, detail=Using ADC",
+      "category": "health"
+    },
+    {
+      "name": "Overall health: healthy",
+      "passed": true,
+      "detail": "status=healthy",
+      "category": "health"
+    },
+    {
+      "name": "Env var: WCAG_ADOBE_CLIENT_ID",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_ADOBE_CLIENT_SECRET",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_GCP_PROJECT_ID",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_GCP_REGION",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_VERTEX_AI_MODEL",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_VERTEX_AI_LOCATION",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: PYTHONPATH",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_DB_PATH",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: WCAG_EXTRACTION_CACHE_DIR",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Env var: PYTHONUNBUFFERED",
+      "passed": true,
+      "detail": "present",
+      "category": "env_vars"
+    },
+    {
+      "name": "Test PDF created",
+      "passed": true,
+      "detail": "1520 bytes",
+      "category": "analyze"
+    },
+    {
+      "name": "Analyze returns 200",
+      "passed": true,
+      "detail": "Got 200: ",
+      "category": "analyze"
+    },
+    {
+      "name": "Response has task_id",
+      "passed": true,
+      "detail": "task_id=c271a9c2-331a-4d33-9d45-056edc7ad788",
+      "category": "analyze"
+    },
+    {
+      "name": "50 WCAG rules checked",
+      "passed": true,
+      "detail": "rules_checked=50",
+      "category": "analyze"
+    },
+    {
+      "name": "pipeline_metadata present",
+      "passed": true,
+      "detail": "present",
+      "category": "analyze"
+    },
+    {
+      "name": "pipeline_metadata.stages is non-empty list",
+      "passed": true,
+      "detail": "3 stages",
+      "category": "analyze"
+    },
+    {
+      "name": "pipeline_metadata.overall_status present",
+      "passed": true,
+      "detail": "overall_status=success",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'extract' present in metadata",
+      "passed": true,
+      "detail": "stages=['extract', 'deterministic_fixes', 'ai_alt_text']",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'deterministic_fixes' present in metadata",
+      "passed": true,
+      "detail": "stages=['extract', 'deterministic_fixes', 'ai_alt_text']",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'ai_alt_text' present in metadata",
+      "passed": true,
+      "detail": "stages=['extract', 'deterministic_fixes', 'ai_alt_text']",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'extract' has valid status",
+      "passed": true,
+      "detail": "status=success",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'deterministic_fixes' has valid status",
+      "passed": true,
+      "detail": "status=success",
+      "category": "analyze"
+    },
+    {
+      "name": "Stage 'ai_alt_text' has valid status",
+      "passed": true,
+      "detail": "status=success",
+      "category": "analyze"
+    },
+    {
+      "name": "AI alt text stage has work metrics",
+      "passed": true,
+      "detail": "metadata keys=['images_total', 'ai_attempted', 'ai_succeeded', 'ai_failed', 'skipped_no_src', 'skipped_has_alt', 'placeholder_remaining']",
+      "category": "analyze"
+    },
+    {
+      "name": "Proposals is a list",
+      "passed": true,
+      "detail": "type=list, count=3",
+      "category": "analyze"
+    },
+    {
+      "name": "Remediate returns 200",
+      "passed": true,
+      "detail": "Got 200: ",
+      "category": "remediate"
+    },
+    {
+      "name": "X-Task-Id header present",
+      "passed": true,
+      "detail": "x-task-id=9b0fdaf8-a72f-422a-9040-e8fbe0bd28cb",
+      "category": "remediate"
+    },
+    {
+      "name": "X-Pipeline-Metadata header present",
+      "passed": true,
+      "detail": "length=803",
+      "category": "remediate"
+    },
+    {
+      "name": "X-Pipeline-Metadata is valid JSON",
+      "passed": true,
+      "detail": "stages=4",
+      "category": "remediate"
+    },
+    {
+      "name": "Pipeline overall_status present",
+      "passed": true,
+      "detail": "overall_status=success",
+      "category": "remediate"
+    },
+    {
+      "name": "X-Remediation-Delta header present",
+      "passed": true,
+      "detail": "value={\"after_failed\": 3, \"after_passed\": 17}",
+      "category": "remediate"
+    },
+    {
+      "name": "HTML has lang=\"en\"",
+      "passed": true,
+      "detail": "found=yes",
+      "category": "remediate"
+    },
+    {
+      "name": "HTML has <title>",
+      "passed": true,
+      "detail": "found=yes",
+      "category": "remediate"
+    },
+    {
+      "name": "HTML has skip-link",
+      "passed": true,
+      "detail": "",
+      "category": "remediate"
+    },
+    {
+      "name": "CORS exposes x-task-id",
+      "passed": true,
+      "detail": "expose_headers=X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta",
+      "category": "cors"
+    },
+    {
+      "name": "CORS exposes x-pipeline-version",
+      "passed": true,
+      "detail": "expose_headers=X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta",
+      "category": "cors"
+    },
+    {
+      "name": "CORS exposes x-pipeline-metadata",
+      "passed": true,
+      "detail": "expose_headers=X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta",
+      "category": "cors"
+    },
+    {
+      "name": "CORS exposes x-remediation-delta",
+      "passed": true,
+      "detail": "expose_headers=X-Task-Id, X-Pipeline-Version, X-Pipeline-Metadata, X-Remediation-Delta",
+      "category": "cors"
+    },
+    {
+      "name": "Database probe healthy",
+      "passed": true,
+      "detail": "status=up",
+      "category": "db_backend"
+    },
+    {
+      "name": "Database detail field present",
+      "passed": true,
+      "detail": "detail=(no detail key \u2014 non-blocking)",
+      "category": "db_backend"
+    },
+    {
+      "name": "Vertex AI health probe not silently passing",
+      "passed": true,
+      "detail": "status=up (should never be 'unchecked')",
+      "category": "silent_fallback"
+    },
+    {
+      "name": "Vertex AI reports HOW it authenticates",
+      "passed": true,
+      "detail": "detail=Using ADC",
+      "category": "silent_fallback"
+    },
+    {
+      "name": "Stage 'extract' success has evidence",
+      "passed": true,
+      "detail": "status=success, metadata_keys=EMPTY",
+      "category": "gate_semantic"
+    },
+    {
+      "name": "Stage 'deterministic_fixes' success has evidence",
+      "passed": true,
+      "detail": "status=success, metadata_keys=EMPTY",
+      "category": "gate_semantic"
+    },
+    {
+      "name": "Stage 'ai_alt_text' success has evidence",
+      "passed": true,
+      "detail": "status=success, metadata_keys=['images_total', 'ai_attempted', 'ai_succeeded', 'ai_failed', 'skipped_no_src', 'skipped_has_alt', 'placeholder_remaining']",
+      "category": "gate_semantic"
+    },
+    {
+      "name": "Stage 'post_remediation_audit' success has evidence",
+      "passed": true,
+      "detail": "status=success, metadata_keys=['rules_checked', 'rules_passed', 'rules_failed', 'coverage_pct']",
+      "category": "gate_semantic"
+    }
+  ]
+}

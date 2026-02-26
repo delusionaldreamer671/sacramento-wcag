@@ -37,6 +37,9 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
@@ -70,12 +73,13 @@ jobs:
             --concurrency 1 \
             --min-instances 0 \
             --max-instances 4 \
-            --set-env-vars "\
+            --update-env-vars "\
               WCAG_GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},\
               WCAG_GCP_REGION=${{ env.GCP_REGION }},\
               WCAG_VERTEX_AI_MODEL=gemini-2.5-pro,\
               WCAG_VERTEX_AI_LOCATION=${{ env.GCP_REGION }},\
               PYTHONPATH=/app,\
+              PYTHONUNBUFFERED=1,\
               WCAG_DB_PATH=/data/wcag_pipeline.db,\
               WCAG_EXTRACTION_CACHE_DIR=/data/.extract_cache,\
               WCAG_ADOBE_CLIENT_ID=${{ secrets.ADOBE_CLIENT_ID }},\
@@ -86,9 +90,15 @@ jobs:
           SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region ${{ env.GCP_REGION }} --format 'value(status.url)')
           echo "Service URL: $SERVICE_URL"
+          echo "SERVICE_URL=$SERVICE_URL" >> "$GITHUB_ENV"
           curl -sf "$SERVICE_URL/api/health" | python -c "
           import json, sys
           data = json.load(sys.stdin)
           assert data['status'] == 'healthy', f'Health check failed: {data}'
           print('Health check passed')
           "
+
+      - name: Run post-deploy verification
+        run: |
+          pip install requests
+          python scripts/verify_deploy.py --url "${{ env.SERVICE_URL }}" --skip-paid-apis

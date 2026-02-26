@@ -10,20 +10,14 @@ export type DocumentStatus =
   | "complete"
   | "failed";
 
-export type WCAGCriterion =
-  | "1.1.1"
-  | "1.2.1" | "1.2.2" | "1.2.3" | "1.2.4" | "1.2.5"
-  | "1.3.1" | "1.3.2" | "1.3.3" | "1.3.4" | "1.3.5"
-  | "1.4.1" | "1.4.2" | "1.4.3" | "1.4.4" | "1.4.5" | "1.4.10" | "1.4.11" | "1.4.12" | "1.4.13"
-  | "2.1.1" | "2.1.2" | "2.1.4"
-  | "2.2.1" | "2.2.2"
-  | "2.3.1"
-  | "2.4.1" | "2.4.2" | "2.4.3" | "2.4.4" | "2.4.5" | "2.4.6" | "2.4.7"
-  | "2.5.1" | "2.5.2" | "2.5.3" | "2.5.4"
-  | "3.1.1" | "3.1.2"
-  | "3.2.1" | "3.2.2" | "3.2.3" | "3.2.4"
-  | "3.3.1" | "3.3.2" | "3.3.3" | "3.3.4"
-  | "4.1.1" | "4.1.2" | "4.1.3";
+/**
+ * WCAG criterion identifier.
+ * Using `string` to accept all criteria the backend may return (50+ rules).
+ * Known values include: 1.1.1, 1.2.1-1.2.5, 1.3.1-1.3.5, 1.4.1-1.4.13,
+ * 2.1.1-2.1.4, 2.2.1-2.2.2, 2.3.1, 2.4.1-2.4.7, 2.5.1-2.5.4,
+ * 3.1.1-3.1.2, 3.2.1-3.2.4, 3.3.1-3.3.4, 4.1.1-4.1.3.
+ */
+export type WCAGCriterion = string;
 
 export const WCAG_CRITERION_LABELS: Record<string, string> = {
   "1.1.1": "Non-text Content",
@@ -87,8 +81,19 @@ export type ReviewerDecision = "approve" | "edit" | "reject";
 export interface PDFDocument {
   id: string;
   filename: string;
-  gcs_input_path: string;
-  gcs_output_path: string | null;
+  /**
+   * GCS input path (e.g. gs://bucket/input/filename.pdf).
+   * Optional because the list endpoint (DocumentStatusResponse) does not
+   * include GCS paths — they are only present on full document records.
+   * Clients that construct PDFDocument from DocumentStatusResponse should
+   * leave this undefined rather than supplying a dummy value.
+   */
+  gcs_input_path?: string;
+  /**
+   * GCS output path — only present after recompilation completes.
+   * Optional for the same reason as gcs_input_path above.
+   */
+  gcs_output_path?: string | null;
   status: DocumentStatus;
   page_count: number;
   created_at: string;
@@ -121,6 +126,8 @@ export interface HITLReviewItem {
   id: string;
   document_id: string;
   finding_id: string;
+  /** WCAG criterion code (e.g. "1.1.1"). May be absent on older records. */
+  criterion?: WCAGCriterion;
   element_type: string;
   original_content: Record<string, unknown>;
   ai_suggestion: string;

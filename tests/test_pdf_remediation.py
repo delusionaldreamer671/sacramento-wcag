@@ -224,7 +224,7 @@ class TestInjectAltText:
         )
 
         pdf = _open_from_bytes(tagged_pdf_bytes)
-        injected = _inject_alt_text(pdf, ["Bar chart of Q1 revenue"])
+        injected = _inject_alt_text(pdf, [{"alt": "Bar chart of Q1 revenue", "page_num": 0, "bbox": None, "image_id": "img-1"}])
         assert injected == 1
 
         # Verify the /Alt was set on the /Figure element
@@ -242,9 +242,9 @@ class TestInjectAltText:
 
         pdf = _open_from_bytes(tagged_pdf_bytes)
         # Set alt text first
-        _inject_alt_text(pdf, ["Existing alt"])
+        _inject_alt_text(pdf, [{"alt": "Existing alt", "page_num": 0, "bbox": None, "image_id": "img-1"}])
         # Try again — should skip
-        injected = _inject_alt_text(pdf, ["New alt"])
+        injected = _inject_alt_text(pdf, [{"alt": "New alt", "page_num": 0, "bbox": None, "image_id": "img-1"}])
         assert injected == 0
         pdf.close()
 
@@ -255,7 +255,7 @@ class TestInjectAltText:
         )
 
         pdf = _open_from_bytes(tagged_pdf_bytes)
-        injected = _inject_alt_text(pdf, [""])
+        injected = _inject_alt_text(pdf, [{"alt": "", "page_num": 0, "bbox": None, "image_id": "img-1"}])
         assert injected == 0
         pdf.close()
 
@@ -272,7 +272,7 @@ class TestInjectAltText:
         pdf.close()
 
         pdf2 = _open_from_bytes(buf.getvalue())
-        injected = _inject_alt_text(pdf2, ["Should not crash"])
+        injected = _inject_alt_text(pdf2, [{"alt": "Should not crash", "page_num": 0, "bbox": None, "image_id": "img-1"}])
         assert injected == 0
         pdf2.close()
 
@@ -287,7 +287,10 @@ class TestCollectors:
         from services.recompilation.pdf_tag_enhancer import _collect_alt_texts
 
         alts = _collect_alt_texts(simple_ir_doc)
-        assert alts == ["Bar chart of Q1 revenue"]
+        assert len(alts) == 1
+        assert alts[0]["alt"] == "Bar chart of Q1 revenue"
+        assert alts[0]["page_num"] == 0
+        assert "image_id" in alts[0]
 
     def test_collect_alt_texts_empty_doc(self):
         from services.recompilation.pdf_tag_enhancer import _collect_alt_texts
@@ -299,7 +302,7 @@ class TestCollectors:
         from services.recompilation.pdf_tag_enhancer import _collect_headings
 
         headings = _collect_headings(simple_ir_doc)
-        assert headings == [(1, "Annual Report")]
+        assert headings == [(1, "Annual Report", 0)]
 
     def test_collect_headings_multiple(self):
         from services.recompilation.pdf_tag_enhancer import _collect_headings
@@ -311,8 +314,8 @@ class TestCollectors:
         ])
         headings = _collect_headings(doc)
         assert len(headings) == 3
-        assert headings[0] == (1, "Title")
-        assert headings[1] == (2, "Section A")
+        assert headings[0] == (1, "Title", 0)
+        assert headings[1] == (2, "Section A", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +333,9 @@ class TestGenerateBookmarks:
 
         pdf = _open_from_bytes(tagged_pdf_bytes)
         created = _generate_bookmarks(pdf, [
-            (1, "Title"),
-            (2, "Section A"),
-            (2, "Section B"),
+            (1, "Title", 0),
+            (2, "Section A", 0),
+            (2, "Section B", 0),
         ])
         assert created == 3
         pdf.close()
@@ -430,8 +433,10 @@ class TestStageOutputPdf:
         assert content_type == "text/html; charset=utf-8"
         assert b"Hello world" in output_bytes
 
-    def test_pdf_format_falls_back_to_reportlab_without_pdf_bytes(self):
-        """PDF format without source pdf_bytes uses reportlab fallback."""
+    def test_pdf_format_raises_without_auto_tag(self):
+        """PDF format raises RuntimeError when Auto-Tag is not available (no Playwright fallback)."""
+        from unittest.mock import patch
+
         from services.ingestion.converter import stage_output
         from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -439,12 +444,12 @@ class TestStageOutputPdf:
         builder.add_element("paragraph", "Hello world")
         html = builder.build_semantic_html()
 
-        output_bytes, content_type = stage_output(html, "pdf", builder)
-        assert content_type == "application/pdf"
-        assert output_bytes[:4] == b"%PDF"
+        with patch("services.ingestion.converter._try_auto_tag_path", return_value=None):
+            with pytest.raises(RuntimeError, match="Auto-Tag"):
+                stage_output(html, "pdf", builder)
 
-    def test_pdf_format_falls_back_without_ir_doc(self):
-        """PDF format without ir_doc uses reportlab fallback."""
+    def test_pdf_format_raises_without_ir_doc(self):
+        """PDF format without ir_doc raises RuntimeError (Auto-Tag path requires both pdf_bytes and ir_doc)."""
         from services.ingestion.converter import stage_output
         from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -452,11 +457,9 @@ class TestStageOutputPdf:
         builder.add_element("paragraph", "Test content")
         html = builder.build_semantic_html()
 
-        output_bytes, content_type = stage_output(
-            html, "pdf", builder, pdf_bytes=b"fake-pdf"
-        )
-        assert content_type == "application/pdf"
-        assert output_bytes[:4] == b"%PDF"
+        # No ir_doc provided — Auto-Tag path cannot proceed, raises with clear message
+        with pytest.raises(RuntimeError, match="Auto-Tag"):
+            stage_output(html, "pdf", builder, pdf_bytes=b"fake-pdf")
 
     @skip_no_pikepdf
     def test_pdf_with_auto_tag_mock(self, simple_ir_doc: IRDocument):
@@ -486,8 +489,8 @@ class TestStageOutputPdf:
             assert content_type == "application/pdf"
             assert output_bytes[:4] == b"%PDF"
 
-    def test_pdf_auto_tag_failure_falls_back_gracefully(self, simple_ir_doc: IRDocument):
-        """When Auto-Tag path fails, must fall back to reportlab without crashing."""
+    def test_pdf_auto_tag_failure_raises(self, simple_ir_doc: IRDocument):
+        """When Auto-Tag fails, raises RuntimeError — no Playwright fallback for tagged PDF output."""
         from services.ingestion.converter import stage_output
         from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -499,12 +502,11 @@ class TestStageOutputPdf:
             "services.ingestion.converter._try_auto_tag_path",
             return_value=None,
         ):
-            output_bytes, content_type = stage_output(
-                html, "pdf", builder,
-                pdf_bytes=b"source-pdf", ir_doc=simple_ir_doc,
-            )
-            assert content_type == "application/pdf"
-            assert output_bytes[:4] == b"%PDF"
+            with pytest.raises(RuntimeError, match="Auto-Tag"):
+                stage_output(
+                    html, "pdf", builder,
+                    pdf_bytes=b"source-pdf", ir_doc=simple_ir_doc,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -513,8 +515,8 @@ class TestStageOutputPdf:
 
 
 class TestGenerateTaggedPdfFallback:
-    def test_no_pdf_bytes_uses_reportlab(self):
-        """_generate_tagged_pdf with None pdf_bytes must use reportlab."""
+    def test_no_pdf_bytes_raises_without_auto_tag(self):
+        """_generate_tagged_pdf with None pdf_bytes raises RuntimeError (no Playwright fallback)."""
         from services.ingestion.converter import _generate_tagged_pdf
         from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -523,12 +525,11 @@ class TestGenerateTaggedPdfFallback:
         html = builder.build_semantic_html()
 
         span = MagicMock()
-        result = _generate_tagged_pdf(None, None, html, builder, span)
-        assert result[:4] == b"%PDF"
-        span.set_attribute.assert_any_call("output.pdf_method", "reportlab_fallback")
+        with pytest.raises(RuntimeError, match="Auto-Tag"):
+            _generate_tagged_pdf(None, None, html, builder, span)
 
-    def test_no_ir_doc_uses_reportlab(self):
-        """_generate_tagged_pdf with None ir_doc must use reportlab."""
+    def test_no_ir_doc_raises_without_auto_tag(self):
+        """_generate_tagged_pdf with None ir_doc raises RuntimeError (no Playwright fallback)."""
         from services.ingestion.converter import _generate_tagged_pdf
         from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -537,8 +538,8 @@ class TestGenerateTaggedPdfFallback:
         html = builder.build_semantic_html()
 
         span = MagicMock()
-        result = _generate_tagged_pdf(b"fake", None, html, builder, span)
-        assert result[:4] == b"%PDF"
+        with pytest.raises(RuntimeError, match="Auto-Tag"):
+            _generate_tagged_pdf(b"fake", None, html, builder, span)
 
 
 # ---------------------------------------------------------------------------

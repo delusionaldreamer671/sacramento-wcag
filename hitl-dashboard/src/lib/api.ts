@@ -78,6 +78,14 @@ async function request<T>(
   });
 
   if (!response.ok) {
+    // Intercept 401 Unauthorized — clear auth state and redirect to login
+    if (response.status === 401) {
+      _authToken = null;
+      if (typeof window !== "undefined") {
+        try { localStorage.removeItem("wcag_auth"); } catch { /* SSR or restricted context */ }
+        window.location.href = "/login";
+      }
+    }
     const detail = await extractErrorMessage(response);
     throw new APIError(
       response.status,
@@ -97,6 +105,10 @@ async function request<T>(
 /**
  * Fetch the list of documents in the remediation queue.
  *
+ * The backend returns DocumentStatusResponse[] (with `document_id`).
+ * We normalise each record to include an `id` alias so downstream code
+ * (DocumentQueue, page.tsx) can use `doc.id` consistently.
+ *
  * @param skip - Number of records to skip (pagination offset). Defaults to 0.
  * @param limit - Maximum number of records to return. Defaults to 50.
  */
@@ -108,7 +120,18 @@ export async function fetchDocuments(
     skip: String(skip),
     limit: String(limit),
   });
-  return request<PDFDocument[]>(`/api/v1/documents?${params.toString()}`);
+  const raw = await request<DocumentStatusResponse[]>(`/api/v1/documents?${params.toString()}`);
+  // Normalise: backend sends document_id; frontend expects id.
+  // gcs_input_path and gcs_output_path are not included in the list
+  // endpoint response — they are omitted here rather than set to dummy values.
+  return raw.map((item) => ({
+    id: item.document_id,
+    filename: item.filename,
+    status: item.status,
+    page_count: item.page_count,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  }));
 }
 
 /**
@@ -153,6 +176,15 @@ export async function submitReview(
 
 /**
  * Batch-approve multiple SIMPLE-flagged review items at once.
+ *
+ * This function targets the HITL review-items workflow
+ * (POST /api/v1/review-items/batch-approve), which is distinct from the
+ * alt-text batch-approve endpoint used by batchApproveAltText().
+ *
+ * The backend endpoint is implemented in services/ingestion/api_review_items.py.
+ * It is not yet wired into the upload/remediation UI flow (the 3-step upload
+ * page uses the alt-text workflow instead); however the endpoint and this
+ * function are kept for the HITL review panel (review/[id]/page.tsx).
  */
 export async function batchApprove(request_: BatchApproveRequest): Promise<void> {
   if (!request_.item_ids?.length) {
@@ -181,6 +213,8 @@ export async function fetchHealth(): Promise<PipelineHealthResponse> {
 export interface ConvertResult {
   blob: Blob;
   taskId: string | null;
+  pipelineMetadata: Record<string, unknown> | null;
+  remediationDelta: Record<string, unknown> | null;
 }
 
 export async function uploadAndConvert(
@@ -197,6 +231,7 @@ export async function uploadAndConvert(
   const response = await fetch(url, {
     method: "POST",
     body: formData,
+    signal: AbortSignal.timeout(300_000), // 5 min — large PDFs take 60-90s
     // Do NOT set Content-Type — browser sets multipart boundary automatically
   });
 
@@ -210,8 +245,21 @@ export async function uploadAndConvert(
   }
 
   const taskId = response.headers.get("X-Task-Id");
+
+  let pipelineMetadata: Record<string, unknown> | null = null;
+  try {
+    const raw = response.headers.get("X-Pipeline-Metadata");
+    if (raw) pipelineMetadata = JSON.parse(raw) as Record<string, unknown>;
+  } catch { /* header missing or malformed — non-fatal */ }
+
+  let remediationDelta: Record<string, unknown> | null = null;
+  try {
+    const raw = response.headers.get("X-Remediation-Delta");
+    if (raw) remediationDelta = JSON.parse(raw) as Record<string, unknown>;
+  } catch { /* header missing or malformed — non-fatal */ }
+
   const blob = await response.blob();
-  return { blob, taskId };
+  return { blob, taskId, pipelineMetadata, remediationDelta };
 }
 
 export interface RemediationEvent {
@@ -254,6 +302,8 @@ export interface AnalysisProposal {
   page: number;
   auto_fixable: boolean;
   action_type: "auto_fix" | "ai_draft" | "manual_review";
+  review_priority?: number;
+  technique_refs?: string;
 }
 
 export interface RuleBreakdownEntry {
@@ -295,6 +345,44 @@ export interface AltTextProposal {
   reviewer_edit: string | null;
 }
 
+/** A single pipeline stage entry within PipelineMetadata. */
+export interface PipelineStage {
+  stage_name: string;
+  status: "success" | "skipped" | "degraded" | "failed";
+  duration_ms: number;
+  errors: string[];
+  warnings: string[];
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * Pipeline execution metadata returned by the /analyze and /remediate
+ * endpoints in the X-Pipeline-Metadata header and the analyze response body.
+ *
+ * This type is the single source of truth shared by api.ts and any consumer
+ * components (e.g. upload/page.tsx PipelineHealthPanel).  Additional optional
+ * fields (baseline_audit, validation_confidence) may be present in the
+ * remediate response but not in analyze — consumers must treat them as
+ * optional.
+ */
+export interface PipelineMetadata {
+  task_id: string;
+  stages: PipelineStage[];
+  overall_status: string;
+  baseline_audit?: {
+    rules_checked: number;
+    rules_passed: number;
+    rules_failed: number;
+    coverage_pct: number;
+  };
+  validation_confidence?: {
+    high: number;
+    medium: number;
+    low: number;
+    needs_human_review: number;
+  };
+}
+
 export interface AnalysisResult {
   task_id: string;
   filename: string;
@@ -302,6 +390,8 @@ export interface AnalysisResult {
   proposals: AnalysisProposal[];
   summary: AnalysisSummary;
   alt_text_proposals: AltTextProposal[];
+  /** Pipeline execution metadata — present when the backend includes it. */
+  pipeline_metadata?: PipelineMetadata;
 }
 
 /**
@@ -319,6 +409,7 @@ export async function analyzeDocument(file: File): Promise<AnalysisResult> {
   const response = await fetch(url, {
     method: "POST",
     body: formData,
+    signal: AbortSignal.timeout(300_000), // 5 min — large PDFs take 60-90s
   });
 
   if (!response.ok) {
@@ -346,15 +437,16 @@ export async function remediateDocument(
 
   const formData = new FormData();
   formData.append("file", file);
-  if (approvedIds && approvedIds.length > 0) {
-    formData.append("approved_ids", JSON.stringify(approvedIds));
-  }
+  // Always send approved_ids — an empty array means "apply nothing".
+  // Omitting it causes the backend to apply ALL remediations.
+  formData.append("approved_ids", JSON.stringify(approvedIds ?? []));
 
   const url = `${BASE_URL}/api/v1/remediate?output_format=${encodeURIComponent(outputFormat)}&validation_mode=draft`;
 
   const response = await fetch(url, {
     method: "POST",
     body: formData,
+    signal: AbortSignal.timeout(300_000), // 5 min — large PDFs take 60-90s
   });
 
   if (!response.ok) {
@@ -367,8 +459,21 @@ export async function remediateDocument(
   }
 
   const taskId = response.headers.get("X-Task-Id");
+
+  let pipelineMetadata: Record<string, unknown> | null = null;
+  try {
+    const raw = response.headers.get("X-Pipeline-Metadata");
+    if (raw) pipelineMetadata = JSON.parse(raw) as Record<string, unknown>;
+  } catch { /* header missing or malformed — non-fatal */ }
+
+  let remediationDelta: Record<string, unknown> | null = null;
+  try {
+    const raw = response.headers.get("X-Remediation-Delta");
+    if (raw) remediationDelta = JSON.parse(raw) as Record<string, unknown>;
+  } catch { /* header missing or malformed — non-fatal */ }
+
   const blob = await response.blob();
-  return { blob, taskId };
+  return { blob, taskId, pipelineMetadata, remediationDelta };
 }
 
 // --- Proposals API ---

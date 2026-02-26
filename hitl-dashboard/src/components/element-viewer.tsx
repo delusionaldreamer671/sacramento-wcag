@@ -47,10 +47,32 @@ function ImageElement({ content }: { content: Record<string, unknown> }) {
   const page = getNumber(content, "page", 1);
   const surroundingText = getString(content, "surrounding_text", "");
   const currentAlt = getString(content, "current_alt", "");
+  const imageId = getString(content, "image_id", "");
+
+  const apiBase = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
+  const imgSrc =
+    imageId ? `${apiBase}/api/v1/images/${encodeURIComponent(imageId)}` : "";
 
   return (
     <section aria-label="Original image element">
-      {/* Bounding box placeholder — actual image render requires binary extraction */}
+      {/* Render actual image when image_id is available, fall back to placeholder */}
+      {imgSrc && (
+        <img
+          src={imgSrc}
+          alt={currentAlt || "Image extracted from PDF"}
+          className="max-w-full rounded-md border border-border"
+          style={{ maxHeight: "400px", objectFit: "contain" }}
+          onError={(e) => {
+            // Hide broken image, show fallback placeholder
+            const target = e.target as HTMLImageElement;
+            target.style.display = "none";
+            const fallback = target.nextElementSibling;
+            if (fallback) (fallback as HTMLElement).style.display = "flex";
+          }}
+        />
+      )}
+
+      {/* Placeholder — shown when no imgSrc, or as fallback after image load error */}
       <div
         role="img"
         aria-label={
@@ -65,6 +87,7 @@ function ImageElement({ content }: { content: Record<string, unknown> }) {
         )}
         style={{
           aspectRatio: width && height ? `${width}/${height}` : "16/9",
+          display: imgSrc ? "none" : "flex",
         }}
       >
         <div className="flex flex-col items-center gap-1 p-4 text-center">

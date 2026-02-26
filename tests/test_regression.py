@@ -154,7 +154,7 @@ def test_output_images_have_src():
     pdf_path = pdfs[0]
     pdf_bytes = pdf_path.read_bytes()
 
-    output_bytes, _ = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
+    output_bytes, _, _ = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
     html = output_bytes.decode("utf-8")
 
     imgs_total = len(re.findall(r"<img ", html))
@@ -193,7 +193,7 @@ def test_output_no_merged_allcaps_words():
 
     from services.ingestion.converter import convert_pdf_sync
 
-    output_bytes, _ = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
+    output_bytes, _, _ = convert_pdf_sync(pdf_bytes, pdf_path.name, "html")
     html = output_bytes.decode("utf-8")
 
     found_merged = []

@@ -7,10 +7,13 @@ Timestamps are ISO-8601 UTC strings.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -192,8 +195,13 @@ def _decode_row(table: str, row: dict) -> dict:
         if row.get(field):
             try:
                 row[field] = json.loads(row[field])
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as exc:
+                raw = row[field]
+                truncated = str(raw)[:120] if raw else ""
+                logger.warning(
+                    "JSON decode failed: table=%s field=%s error=%s raw_value=%.120s",
+                    table, field, exc, truncated,
+                )
     return row
 
 
@@ -226,6 +234,24 @@ class Database:
             self._backend.execute_ddl(_POSTGRES_DDL)
         else:
             self._backend.execute_ddl(_DDL)
+
+        # Detect Alembic migrations state: if alembic_version table exists,
+        # log a warning so operators know to run migrations separately.
+        # We do NOT auto-run Alembic here — that is an operator action.
+        try:
+            row = self._backend.fetchone(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='alembic_version'"
+                if self._backend.backend_type != "postgres"
+                else "SELECT table_name FROM information_schema.tables "
+                     "WHERE table_name='alembic_version'"
+            )
+            if row is None:
+                logger.warning(
+                    "alembic_version table not found — Alembic migrations have not been "
+                    "applied. Run 'alembic upgrade head' to initialise the migration history."
+                )
+        except Exception as exc:
+            logger.debug("Could not check alembic_version table: %s", exc)
 
     def _one(self, sql: str, p: tuple = (), table: str = "") -> dict | None:
         row = self._backend.fetchone(sql, p)
@@ -340,15 +366,58 @@ class Database:
 
     def update_review_decision(self, item_id: str, decision: str,
                                 edit: str | None = None,
-                                reviewer_id: str | None = None) -> dict | None:
+                                reviewer_id: str | None = None,
+                                expected_current_decision: str | None = None) -> dict | None:
+        """Update the reviewer decision on a review item.
+
+        Uses optimistic concurrency: the UPDATE includes the expected current
+        state in the WHERE clause and checks rows_affected to detect conflicts.
+
+        Args:
+            item_id: The review item ID to update.
+            decision: The new decision value ("approve", "edit", "reject").
+            edit: Optional edited text from the reviewer.
+            reviewer_id: Username or ID of the reviewer.
+            expected_current_decision: If provided, the UPDATE only proceeds if
+                the current reviewer_decision matches this value. Pass None to
+                allow update regardless of current state (backward compatible).
+
+        Returns:
+            Updated row dict, or None if the item does not exist or a
+            concurrency conflict was detected.
+        """
+        # Read current value for audit log only — not used for the update gate
         old = self._one("SELECT reviewer_decision FROM review_items WHERE id=?", (item_id,))
-        self._run(
-            "UPDATE review_items SET reviewer_decision=?,reviewer_edit=?,"
-            "reviewed_at=?,reviewed_by=? WHERE id=?",
-            (decision, edit, _now(), reviewer_id, item_id),
-        )
+        if old is None:
+            return None
+
+        # Build WHERE clause to include expected current state (optimistic lock)
+        if expected_current_decision is not None:
+            sql = (
+                "UPDATE review_items SET reviewer_decision=?,reviewer_edit=?,"
+                "reviewed_at=?,reviewed_by=? WHERE id=? AND reviewer_decision=?"
+            )
+            params = (decision, edit, _now(), reviewer_id, item_id, expected_current_decision)
+        else:
+            sql = (
+                "UPDATE review_items SET reviewer_decision=?,reviewer_edit=?,"
+                "reviewed_at=?,reviewed_by=? WHERE id=?"
+            )
+            params = (decision, edit, _now(), reviewer_id, item_id)
+
+        cur = self._backend.execute(sql, params)
+        self._backend.commit()
+
+        if cur.rowcount == 0:
+            logger.warning(
+                "update_review_decision: 0 rows updated for item_id=%s "
+                "(expected_decision=%r, actual_decision=%r) — possible concurrency conflict",
+                item_id, expected_current_decision, old.get("reviewer_decision"),
+            )
+            return None
+
         self.log_audit("review_item", item_id, "decision", performed_by=reviewer_id,
-                       old_value=old["reviewer_decision"] if old else None,
+                       old_value=old["reviewer_decision"],
                        new_value=decision)
         return self._one("SELECT * FROM review_items WHERE id=?", (item_id,),
                          table="review_items")
@@ -840,14 +909,13 @@ def get_db(db_path: str = "wcag_pipeline.db") -> Database:
     """
     global _instance
     if _instance is None:
-        try:
-            from services.common.config import settings
-            if settings.db_backend == "postgres" and settings.postgres_url:
-                from services.common.db_backend import create_backend
-                backend = create_backend("postgres", postgres_url=settings.postgres_url)
-                _instance = Database(backend=backend)
-                return _instance
-        except Exception:
-            pass  # Fall through to SQLite default
+        from services.common.config import settings
+        if settings.db_backend == "postgres" and settings.postgres_url:
+            # Fail-fast: if postgres is configured but connection fails,
+            # do NOT silently fall back to ephemeral SQLite (data loss on Cloud Run).
+            from services.common.db_backend import create_backend
+            backend = create_backend("postgres", postgres_url=settings.postgres_url)
+            _instance = Database(backend=backend)
+            return _instance
         _instance = Database(db_path)
     return _instance

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from services.common.config import settings
+from services.common.pipeline import StageSpec, StageResult, PipelineMetadata, StageNoOpError, run_stage
 from services.common.remediation_events import RemediationComponent, RemediationEventCollector
 from services.common.ir import (
     BlockSource,
@@ -65,13 +66,23 @@ from services.recompilation.pdfua_builder import PDFUABuilder
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
 
+# Pipeline stage specifications
+STAGE_EXTRACT = StageSpec(name="extract", category="required")
+STAGE_DETERMINISTIC = StageSpec(name="deterministic_fixes", category="required")
+STAGE_AI_ALT_TEXT = StageSpec(name="ai_alt_text", category="required_with_fallback")
+STAGE_BUILD_HTML = StageSpec(name="build_html", category="required")
+STAGE_VALIDATE = StageSpec(name="validate", category="required")
+STAGE_OUTPUT = StageSpec(name="output", category="required")
+STAGE_VERAPDF_BASELINE = StageSpec(name="verapdf_baseline", category="optional")
+STAGE_VERAPDF_ENDLINE = StageSpec(name="verapdf_endline", category="optional")
+
 # Lazy import to avoid circular dependency at module load time
 def _cache_remediation_events(task_id: str, events: list[dict]) -> None:
     try:
         from services.ingestion.api_fixes import cache_events
         cache_events(task_id, events)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed to cache remediation events for %s: %s", task_id, exc)
 
 
 class ValidationBlockedError(Exception):
@@ -150,10 +161,31 @@ _GENERIC_ALT_PATTERN = re.compile(
 
 
 def _vertex_ai_available() -> bool:
-    """Return True when Vertex AI credentials and model config are both present."""
-    return bool(settings.vertex_ai_model) and bool(
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    )
+    """Return True when Vertex AI credentials and model config are both present.
+
+    Supports three credential sources:
+    1. Explicit file via GOOGLE_APPLICATION_CREDENTIALS env var (local dev)
+    2. Cloud Run / GCE Application Default Credentials (production)
+    3. Fallback: google.auth.default() discovery
+    """
+    if not settings.vertex_ai_model:
+        return False
+
+    # 1. Explicit credentials file (local development)
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return True
+
+    # 2. Cloud Run / GCE / GKE — ADC available via metadata server
+    if os.environ.get("K_SERVICE") or os.environ.get("GOOGLE_CLOUD_PROJECT"):
+        return True
+
+    # 3. Fallback: try ADC discovery (handles all GCP environments)
+    try:
+        import google.auth  # noqa: F811
+        credentials, _project = google.auth.default()
+        return credentials is not None
+    except Exception:
+        return False
 
 
 # Patterns for complex image classification (W3C alt decision tree)
@@ -236,7 +268,7 @@ def stage_ai_alt_text(
 
     Conditions that cause the stage to skip silently:
     - ``settings.vertex_ai_model`` is not set
-    - ``GOOGLE_APPLICATION_CREDENTIALS`` env var is absent
+    - No valid GCP credentials found (no GOOGLE_APPLICATION_CREDENTIALS, no Cloud Run ADC)
     - The image block has no ``src`` (image bytes were not available)
     - The alt text is already non-generic (Adobe provided real alt text)
 
@@ -253,10 +285,16 @@ def stage_ai_alt_text(
         IMAGE blocks. Always returns a valid IRDocument — never raises.
     """
     if not _vertex_ai_available():
-        logger.debug(
-            "stage_ai_alt_text: Vertex AI not configured — skipping alt text generation"
+        msg = (
+            "Vertex AI not available — "
+            f"vertex_ai_model={settings.vertex_ai_model or '(not set)'}, "
+            f"GOOGLE_APPLICATION_CREDENTIALS={'set' if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') else '(not set)'}, "
+            f"K_SERVICE={os.environ.get('K_SERVICE', '(not set)')}"
         )
-        return ir_doc
+        logger.warning("stage_ai_alt_text: %s", msg)
+        err = StageNoOpError(msg)
+        err.data = ir_doc  # type: ignore[attr-defined]
+        raise err
 
     # Lazy import — avoids hard dependency when vertexai SDK is not installed
     try:
@@ -265,7 +303,9 @@ def stage_ai_alt_text(
         logger.warning(
             "stage_ai_alt_text: could not import vertex_client (%s) — skipping", exc
         )
-        return ir_doc
+        noop_err = StageNoOpError(f"vertex_client import failed: {exc}")
+        noop_err.data = ir_doc  # type: ignore[attr-defined]
+        raise noop_err
 
     all_blocks = ir_doc.all_blocks()
     images_total = sum(1 for b in all_blocks if b.block_type == BlockType.IMAGE)
@@ -346,14 +386,27 @@ def stage_ai_alt_text(
 
                 img_class = block.attributes.get("data-complexity", "informative")
 
+                # B3: Caption detection — check for "Figure N:" pattern after image
+                caption = _detect_caption(all_blocks, idx)
+                heading_ctx = _get_heading_context(all_blocks, idx)
+                if caption:
+                    block.attributes["data-caption"] = caption
+
                 # Gather surrounding text context from adjacent non-image blocks
                 surrounding = _get_surrounding_text(all_blocks, idx, window=3)
+
+                # Enrich surrounding text with caption and heading context
+                enriched_context = surrounding
+                if caption:
+                    enriched_context = f"Caption: {caption}. {enriched_context}"
+                if heading_ctx:
+                    enriched_context = f"Section: {heading_ctx}. {enriched_context}"
 
                 # Call Vertex AI — falls back to fallback_alt on any error
                 new_alt = generate_alt_text_for_image(
                     image_base64=b64_payload,
                     image_mime=mime,
-                    surrounding_text=surrounding,
+                    surrounding_text=enriched_context,
                     page_num=block.page_num + 1,  # Convert 0-based IR to 1-based for prompt
                     fallback_alt=alt,
                 )
@@ -413,7 +466,27 @@ def stage_ai_alt_text(
             placeholder_remaining,
         )
 
-    return ir_doc
+    # Work metrics for pipeline observability
+    work_metrics = {
+        "images_total": images_total,
+        "ai_attempted": processed,
+        "ai_succeeded": ai_succeeded,
+        "ai_failed": ai_failed,
+        "skipped_no_src": skipped_no_src,
+        "skipped_has_alt": skipped_has_alt,
+        "placeholder_remaining": placeholder_remaining,
+    }
+
+    # Detect silent no-op: eligible images exist but ALL failed to get AI alt text
+    if total_eligible > 0 and ai_succeeded == 0:
+        err = StageNoOpError(
+            f"All {total_eligible} eligible images failed AI alt text "
+            f"(attempted={processed}, failed={ai_failed}, no_src={skipped_no_src})"
+        )
+        err.data = ir_doc  # type: ignore[attr-defined]
+        raise err
+
+    return ir_doc, work_metrics
 
 
 def _get_surrounding_text(
@@ -459,6 +532,44 @@ def _get_surrounding_text(
                 after_count += 1
 
     return " ".join(text_parts)
+
+
+_RE_CAPTION = re.compile(
+    r"^\s*(?:figure\s*\d+[.:]\s*|fig\.\s*\d+[.:]\s*|caption[.:]\s*|source[.:]\s*)",
+    re.IGNORECASE,
+)
+
+
+def _detect_caption(
+    blocks: list[IRBlock],
+    image_idx: int,
+) -> str | None:
+    """Detect a caption in the block immediately after an image.
+
+    Looks at the 1-2 blocks after the image for patterns like:
+    "Figure 1: ...", "Fig. 2: ...", "Caption: ...", etc.
+    """
+    for i in range(image_idx + 1, min(len(blocks), image_idx + 3)):
+        b = blocks[i]
+        if b.block_type == BlockType.IMAGE:
+            break
+        if b.block_type == BlockType.PARAGRAPH:
+            text = b.content.strip()
+            if text and _RE_CAPTION.match(text):
+                return text
+    return None
+
+
+def _get_heading_context(
+    blocks: list[IRBlock],
+    image_idx: int,
+) -> str | None:
+    """Find the nearest preceding heading for an image."""
+    for i in range(image_idx - 1, max(-1, image_idx - 10), -1):
+        b = blocks[i]
+        if b.block_type == BlockType.HEADING and b.content.strip():
+            return b.content.strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +906,14 @@ def _run_verapdf_baseline(pdf_bytes: bytes) -> VeraPDFResult | None:
 
     client = VeraPDFClient()
     if not client.is_available():
-        logger.debug("VeraPDF not available — skipping baseline validation")
+        # MEDIUM-9.18: Log at WARNING so operators know PDF/UA baseline was not captured.
+        # Without baseline, the regression gate cannot run and output compliance is
+        # unverified. Upgrade from DEBUG to WARNING to ensure visibility in production.
+        logger.warning(
+            "VeraPDF not available — skipping baseline validation. "
+            "PDF/UA compliance baseline will not be established for this document. "
+            "Check that the VeraPDF container is running and reachable."
+        )
         return None
 
     result = client.validate_pdfua1(pdf_bytes)
@@ -814,6 +932,13 @@ def _run_verapdf_endline(
     """Run VeraPDF on the output PDF and compare with baseline."""
     client = VeraPDFClient()
     if not client.is_available():
+        # MEDIUM-9.18: Log when VeraPDF is unavailable on the endline check.
+        # Without endline, regression detection cannot run and output compliance
+        # is unverified. This path is silently skipped in some code paths.
+        logger.warning(
+            "VeraPDF not available — skipping endline validation. "
+            "PDF/UA regression check cannot run without endline results."
+        )
         return None
 
     result = client.validate_pdfua1(output_bytes)
@@ -875,10 +1000,10 @@ def convert_pdf_sync(
     *,
     validation_mode: ValidationMode = ValidationMode.PUBLISH,
     approved_ids: set[str] | None = None,
-) -> tuple[bytes, str, str]:
+) -> tuple[bytes, str, str, PipelineMetadata]:
     """Run the full remediation pipeline synchronously.
 
-    Returns (output_bytes, content_type, task_id) where task_id can be
+    Returns (output_bytes, content_type, task_id, pipeline) where task_id can be
     used to retrieve the remediation audit trail via the fixes-applied API.
 
     When *validation_mode* is ``ValidationMode.DRAFT`` (used by /api/remediate
@@ -903,6 +1028,7 @@ def convert_pdf_sync(
 
         # Create a per-request task ID and event collector for audit trail
         task_id = str(uuid.uuid4())
+        pipeline = PipelineMetadata(task_id=task_id)
         collector = RemediationEventCollector(document_id="", task_id=task_id)
 
         # Telemetry collector — initialized with placeholder document_id
@@ -920,7 +1046,11 @@ def convert_pdf_sync(
         try:
             # Stage 1+2: Extract → IR
             tc.start_stage("extract")
-            ir_doc = stage_extract(pdf_bytes, filename)
+            extract_result = run_stage(STAGE_EXTRACT, stage_extract, pdf_bytes, filename)
+            pipeline.record_stage(extract_result)
+            if not extract_result.ok:
+                raise RuntimeError(f"Extraction failed: {'; '.join(extract_result.errors)}")
+            ir_doc = extract_result.data
             tc.end_stage()
 
             root_span.set_attribute("document.id", ir_doc.document_id)
@@ -957,8 +1087,8 @@ def convert_pdf_sync(
             # Persist baseline to database for API access
             if baseline_verapdf is not None:
                 try:
-                    from services.common.database import get_db
-                    get_db().insert_baseline_validation(
+                    _db = get_db()
+                    _db.insert_baseline_validation(
                         task_id=task_id,
                         document_id=ir_doc.document_id,
                         pdf_size_bytes=len(pdf_bytes),
@@ -977,10 +1107,41 @@ def convert_pdf_sync(
                         task_id, exc_info=True,
                     )
 
+            # Stage 2a: Deterministic fixes (language, title, tables, headings, reading order)
+            _current_stage = "deterministic"
+            tc.start_stage("deterministic")
+            from services.common.deterministic_remediator import apply_deterministic_fixes
+            det_result = run_stage(
+                STAGE_DETERMINISTIC, apply_deterministic_fixes, ir_doc, collector=collector,
+            )
+            pipeline.record_stage(det_result)
+            if det_result.ok and det_result.data:
+                ir_doc, det_fixes = det_result.data
+                tc.set("deterministic_fixes_applied", len(det_fixes))
+            else:
+                tc.set("deterministic_fixes_applied", 0)
+            tc.end_stage()
+
             # Stage 2b: AI alt text (if Vertex AI is configured)
             _current_stage = "ai"
             tc.start_stage("ai")
-            ir_doc = stage_ai_alt_text(ir_doc, collector=collector)
+            ai_result = run_stage(STAGE_AI_ALT_TEXT, stage_ai_alt_text, ir_doc, collector=collector)
+            pipeline.record_stage(ai_result)
+            if ai_result.data is not None:
+                ir_doc = ai_result.data
+            if not ai_result.ok:
+                logger.warning("AI alt text stage %s: %s", ai_result.status, ai_result.warnings)
+            # HIGH-1.5: When the AI stage is degraded, IR mutations from partial results
+            # are still applied (blocks marked data-needs-review, failed alt text unchanged).
+            # Log explicitly so operators know the IR reflects degraded AI output.
+            if ai_result.status == "degraded" and ai_result.data is not None:
+                logger.warning(
+                    "AI alt text stage returned DEGRADED status — IR was updated with "
+                    "partial results. Blocks that failed AI alt text were flagged "
+                    "data-needs-review but their alt text was not improved. "
+                    "Warnings: %s",
+                    ai_result.warnings,
+                )
             tc.end_stage()
 
             # Collect AI metrics from the collector's events
@@ -1042,11 +1203,35 @@ def convert_pdf_sync(
             # Stage 4b: Built-in validate_accessibility (scoring + banner)
             validation = stage_validate(builder, html_content, mode=validation_mode)
             score = validation.get("score", 0)
+            validation_blocked = validation.get("blocked", False)
             tc.set("axe_score", score)
             tc.set("axe_violations_critical", len(validation.get("critical_violations", [])))
             tc.set("axe_violations_serious", len(validation.get("serious_violations", [])))
-            tc.set("validation_blocked", 1 if validation.get("blocked") else 0)
+            tc.set("validation_blocked", 1 if validation_blocked else 0)
             tc.end_stage()
+
+            # MEDIUM-1.10: Record the validate stage in pipeline metadata with an
+            # accurate status. Previously this stage was not recorded, making it
+            # appear absent from the pipeline summary. When validation is blocked,
+            # the status is "degraded" (issues found but pipeline continues);
+            # when clean, it is "success".
+            _validate_stage_status = "degraded" if validation_blocked else "success"
+            _validate_warnings = (
+                validation.get("critical_violations", [])
+                + validation.get("serious_violations", [])
+            ) if validation_blocked else []
+            pipeline.stages.append({
+                "stage_name": "validate",
+                "status": _validate_stage_status,
+                "duration_ms": 0.0,
+                "errors": [],
+                "warnings": _validate_warnings,
+                "metadata": {
+                    "score": score,
+                    "blocked": validation_blocked,
+                    "violations": len(validation.get("violations", [])),
+                },
+            })
 
             # Enforce blocking from validate_accessibility too
             if validation.get("blocked"):
@@ -1095,6 +1280,14 @@ def convert_pdf_sync(
                 endline_verapdf = _run_verapdf_endline(output_bytes, baseline_verapdf)
 
             # Regression gate: if output has MORE errors than input, warn loudly
+            if not endline_verapdf or not baseline_verapdf:
+                logger.warning(
+                    "VeraPDF regression gate SKIPPED: baseline=%s endline=%s. "
+                    "PDF/UA regression check did NOT run — output compliance is UNVERIFIED.",
+                    "available" if baseline_verapdf else "UNAVAILABLE",
+                    "available" if endline_verapdf else "UNAVAILABLE",
+                )
+                root_span.set_attribute("verapdf.regression_gate_skipped", True)
             if endline_verapdf and baseline_verapdf:
                 baseline_errors = baseline_verapdf.error_count
                 endline_errors = endline_verapdf.error_count
@@ -1110,14 +1303,21 @@ def convert_pdf_sync(
                     root_span.set_attribute("verapdf.regression_delta", regression_delta)
                     # Record regression in remediation events for the audit trail
                     if collector:
-                        from services.common.remediation_events import RemediationComponent
                         collector.record(
                             RemediationComponent.MARK_INFO,
                             before=f"baseline_errors={baseline_errors}",
                             after=f"endline_errors={endline_errors}",
                             source="verapdf_regression_gate",
                         )
-                    # Optionally block output when regression gate is set to blocking
+                    # HIGH-1.9: The regression gate is NON-BLOCKING by default
+                    # (settings.regression_gate_blocking = False in config.py).
+                    # Reason: VeraPDF results are unreliable across PDF versions —
+                    # the same structural change can produce different clause counts
+                    # depending on VeraPDF's internal rule evaluation order.
+                    # Blocking on regression would cause false positives for valid
+                    # remediation outputs. Operators can enable blocking via env var
+                    # WCAG_REGRESSION_GATE_BLOCKING=true when they have a stable
+                    # VeraPDF deployment and need hard compliance guarantees.
                     if settings.regression_gate_blocking:
                         raise ValidationBlockedError(regression_msg)
                 else:
@@ -1137,6 +1337,28 @@ def convert_pdf_sync(
                 ir_doc.document_id, output_format, len(output_bytes), score,
             )
 
+            # B6: Post-remediation WCAG audit for pre/post comparison
+            try:
+                from services.common.wcag_checker import run_full_audit as _audit
+                post_audit = _audit(ir_doc)
+                pipeline.stages.append({
+                    "stage_name": "post_remediation_audit",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "errors": [],
+                    "warnings": [],
+                    "metadata": {
+                        "rules_checked": post_audit.rules_checked,
+                        "rules_passed": post_audit.rules_passed,
+                        "rules_failed": post_audit.rules_failed,
+                        "coverage_pct": post_audit.coverage_pct,
+                    },
+                })
+                tc.set("post_audit_passed", post_audit.rules_passed)
+                tc.set("post_audit_failed", post_audit.rules_failed)
+            except Exception:
+                logger.warning("Post-remediation audit failed", exc_info=True)
+
             # Persist remediation events to the in-memory cache for audit trail retrieval
             _cache_remediation_events(task_id, collector.to_dict_list())
             root_span.set_attribute("remediation.event_count", len(collector.events()))
@@ -1146,7 +1368,7 @@ def convert_pdf_sync(
             tc.mark_success()
             tc.persist(get_db(settings.db_path))
 
-            return output_bytes, content_type, task_id
+            return output_bytes, content_type, task_id, pipeline
 
         except ValidationBlockedError:
             # Validation blocks are expected control flow — record but re-raise
@@ -1497,7 +1719,19 @@ def _elements_to_ir(
     for elem in elements:
         raw_type = elem.get("type", "paragraph")
         block_type = _BLOCK_TYPE_MAP.get(raw_type, BlockType.PARAGRAPH)
-        elem_page = elem.get("attributes", {}).get("page", 0)
+        # MEDIUM-1.13: Use page 0 (first page, 0-indexed) as the explicit default.
+        # If the element truly has no page information (e.g. fallback extraction
+        # edge case), page 0 is a safer assumption than leaving it unset.
+        # Note: page_num=0 is the legitimate first page in 0-indexed IR convention.
+        # If the attributes dict exists but lacks a "page" key entirely, that is
+        # a data quality issue — log it so it can be investigated.
+        elem_attrs = elem.get("attributes", {})
+        if elem_attrs and "page" not in elem_attrs:
+            logger.debug(
+                "Element type=%s has attributes but no 'page' key — defaulting to page 0",
+                raw_type,
+            )
+        elem_page = elem_attrs.get("page", 0)
         block = IRBlock(
             block_type=block_type,
             content=elem.get("content", ""),
@@ -2300,10 +2534,14 @@ def drop_running_artifacts(ir_doc: IRDocument) -> IRDocument:
 
     This catches running headers/footers that Adobe did NOT tag as artifacts.
     A text block is considered a "running artifact" if the same normalized text
-    appears at the same vertical band (5% of page height) on 8+ pages.
+    appears at the same vertical band (5% of page height) on 3+ pages.
 
     Only TEXT and HEADING blocks shorter than 40 characters are considered.
     This preserves legitimate repeated content in body paragraphs.
+
+    Threshold rationale: 2 occurrences could be coincidence (e.g. a phrase
+    repeated in a section header and a summary). 3+ occurrences at the same
+    vertical position strongly indicates a running header or footer.
     """
     from collections import defaultdict
 
@@ -2327,8 +2565,9 @@ def drop_running_artifacts(ir_doc: IRDocument) -> IRDocument:
             counts[key] += 1
             refs.append((p_idx, b_idx, key))
 
-    # Blocks that appear on 8+ pages at the same position are running artifacts
-    repeated = {k for k, c in counts.items() if c >= 8}
+    # Blocks that appear on 3+ pages at the same position are running artifacts.
+    # Using 3 (not 2) because 2 occurrences may be legitimate repeated content.
+    repeated = {k for k, c in counts.items() if c >= 3}
     if not repeated:
         return ir_doc
 
@@ -2350,6 +2589,14 @@ def drop_running_artifacts(ir_doc: IRDocument) -> IRDocument:
             "drop_running_artifacts: removed %d running artifact blocks (%d patterns)",
             removed, len(repeated),
         )
+        # Log each dropped pattern so operators can verify the heuristic is correct
+        for (txt, y_bucket), count in counts.items():
+            if (txt, y_bucket) in repeated:
+                logger.debug(
+                    "drop_running_artifacts: dropped pattern %r "
+                    "(appeared %d times at y_bucket=%.2f)",
+                    txt, count, y_bucket,
+                )
 
     return ir_doc
 

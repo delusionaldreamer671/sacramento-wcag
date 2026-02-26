@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Security, status
@@ -202,6 +203,27 @@ def _lookup_user_by_raw_token(raw_token: str) -> Optional[dict]:
         if db_user is not None:
             alg = db_user.get("hash_algorithm", "sha256")
             if verify_token(raw_token, db_user["token_hash"], alg):
+                # Check token expiry before accepting the user
+                expires_at = db_user.get("token_expires_at")
+                if expires_at:
+                    try:
+                        expiry_dt = datetime.fromisoformat(expires_at)
+                        if expiry_dt.tzinfo is None:
+                            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) > expiry_dt:
+                            logger.warning(
+                                "Rejected expired token for user=%s (expired=%s)",
+                                db_user.get("username", "unknown"),
+                                expires_at,
+                            )
+                            return None
+                    except (ValueError, TypeError) as exc:
+                        logger.warning(
+                            "Could not parse token_expires_at=%r for user=%s: %s",
+                            expires_at,
+                            db_user.get("username", "unknown"),
+                            exc,
+                        )
                 # Refresh cache
                 entry = {
                     "token_hash": db_user["token_hash"],
@@ -212,8 +234,13 @@ def _lookup_user_by_raw_token(raw_token: str) -> Optional[dict]:
                 }
                 _USER_STORE[sha_hash] = entry
                 return entry
+            else:
+                logger.warning(
+                    "Token verification failed for DB user username=%s",
+                    db_user.get("username", "unknown"),
+                )
     except Exception as exc:
-        logger.debug("DB lookup failed during token verification: %s", exc)
+        logger.warning("DB lookup failed during token verification: %s", exc)
 
     # 3. Final fallback: re-check in-memory store (handles argon2id seeded users)
     #    Iterate only entries that have _raw_token stored (argon2 entries)
@@ -422,10 +449,15 @@ def _seed_user_to_db_and_cache(user_id: str, raw_token: str, role: str) -> None:
         )
         logger.info("Persisted user to DB: user_id=%s algorithm=%s", user_id, alg)
     except Exception as exc:
-        logger.warning(
-            "Could not persist user %s to DB (%s) — using in-memory store only",
+        logger.error(
+            "CRITICAL: Could not persist user %s to DB: %s — "
+            "refusing to fall back to in-memory (data would be lost on restart)",
             user_id, exc,
         )
+        raise RuntimeError(
+            f"User persistence to DB failed for {user_id}: {exc}. "
+            "Fix the database connection before starting the service."
+        ) from exc
 
     # Cache in _USER_STORE (keyed by sha256 for fast lookup path)
     _USER_STORE[sha_hash] = {

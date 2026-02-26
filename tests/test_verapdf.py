@@ -173,12 +173,19 @@ class TestVeraPDFClientIsAvailable:
             called_url = mock_get.call_args[0][0]
             assert "/api/info" in called_url
 
-    def test_client_available_with_any_non_500_status(self):
-        """Status codes below 500 (e.g. 404) still count as 'reachable'."""
+    def test_client_unavailable_with_non_200_status(self):
+        """Status codes other than 200 (e.g. 404) mean the container is not properly configured."""
         with patch("httpx.get") as mock_get:
             mock_get.return_value = _mock_response(status_code=404)
             client = VeraPDFClient(base_url="http://localhost:8080")
-            assert client.is_available() is True
+            assert client.is_available() is False
+
+    def test_client_unavailable_with_401_status(self):
+        """HTTP 401 means authentication failed — container not usable."""
+        with patch("httpx.get") as mock_get:
+            mock_get.return_value = _mock_response(status_code=401)
+            client = VeraPDFClient(base_url="http://localhost:8080")
+            assert client.is_available() is False
 
     def test_client_unavailable_returns_false_on_connection_error(self):
         """ConnectError from httpx.get causes is_available to return False."""
@@ -226,21 +233,40 @@ class TestVeraPDFClientValidatePdfua1Failures:
             result = client.validate_pdfua1(_DUMMY_PDF)
             assert result is None
 
-    def test_non_200_response_returns_none(self):
-        """HTTP 500 from the validation endpoint returns None."""
-        with patch("httpx.post") as mock_post:
+    def test_non_200_5xx_retries_then_returns_none(self):
+        """HTTP 500 from the validation endpoint is retried then returns None."""
+        with patch("httpx.post") as mock_post, \
+             patch("services.common.verapdf_client.time.sleep"):
             mock_post.return_value = _mock_response(status_code=500)
             client = VeraPDFClient(base_url="http://localhost:8080")
             result = client.validate_pdfua1(_DUMMY_PDF)
             assert result is None
+            # Should have been called 3 times (1 initial + 2 retries)
+            assert mock_post.call_count == 3
 
-    def test_non_200_422_response_returns_none(self):
-        """HTTP 422 (Unprocessable Entity) from validation endpoint returns None."""
+    def test_non_200_5xx_succeeds_on_retry(self):
+        """HTTP 500 followed by 200 on retry returns a valid result."""
+        with patch("httpx.post") as mock_post, \
+             patch("services.common.verapdf_client.time.sleep"):
+            mock_post.side_effect = [
+                _mock_response(status_code=500),
+                _mock_response(status_code=200, json_data=_DIRECT_COMPLIANT),
+            ]
+            client = VeraPDFClient(base_url="http://localhost:8080")
+            result = client.validate_pdfua1(_DUMMY_PDF)
+            assert result is not None
+            assert result.is_compliant is True
+            assert mock_post.call_count == 2
+
+    def test_non_200_422_response_returns_none_no_retry(self):
+        """HTTP 422 (Unprocessable Entity) is not retried — returns None immediately."""
         with patch("httpx.post") as mock_post:
             mock_post.return_value = _mock_response(status_code=422)
             client = VeraPDFClient(base_url="http://localhost:8080")
             result = client.validate_pdfua1(_DUMMY_PDF)
             assert result is None
+            # 4xx should NOT be retried
+            assert mock_post.call_count == 1
 
     def test_post_called_with_correct_args(self):
         """validate_pdfua1 POSTs to /api/validate/ua1 with correct Content-Type."""
@@ -405,10 +431,10 @@ class TestVeraPDFClientParseNoncompliantResponse:
 
 
 class TestGateG4VeraPDFUnavailable:
-    """Gate must return passed=True with a P2 soft_fail when VeraPDF is unreachable."""
+    """Gate must return passed=False with a P1 soft_fail when VeraPDF is unreachable."""
 
     def test_gate_unavailable_returns_soft_fail(self):
-        """When VeraPDF container is down, gate passes with P2 soft_fail."""
+        """When VeraPDF container is down, gate fails with P1 soft_fail (fail-closed)."""
         with patch(
             "services.common.verapdf_client.VeraPDFClient.is_available",
             return_value=False,
@@ -416,14 +442,14 @@ class TestGateG4VeraPDFUnavailable:
             gate_result = run_gate_g4_verapdf(_DUMMY_PDF)
 
         assert gate_result.gate_id == "G4-VeraPDF"
-        assert gate_result.passed is True  # Graceful degradation — not a blocker
+        assert gate_result.passed is False  # Fail-closed — unavailability is not a pass
         assert len(gate_result.checks) == 1
 
         check = gate_result.checks[0]
         assert check.status == "soft_fail"
-        assert check.priority == "P2"
-        assert check.next_action == "proceed"
-        assert "not reachable" in check.details.lower() or "skipping" in check.details.lower()
+        assert check.priority == "P1"
+        assert check.next_action == "flag_hitl"
+        assert "not reachable" in check.details.lower() or "skipped" in check.details.lower()
 
     def test_gate_unavailable_check_name(self):
         """Unavailability check has expected check_name."""
@@ -436,7 +462,7 @@ class TestGateG4VeraPDFUnavailable:
         assert gate_result.checks[0].check_name == "verapdf_available"
 
     def test_gate_returns_soft_fail_when_validate_returns_none(self):
-        """If is_available passes but validate_pdfua1 returns None, gate still passes."""
+        """If is_available passes but validate_pdfua1 returns None, gate fails (fail-closed)."""
         with (
             patch(
                 "services.common.verapdf_client.VeraPDFClient.is_available",
@@ -449,10 +475,10 @@ class TestGateG4VeraPDFUnavailable:
         ):
             gate_result = run_gate_g4_verapdf(_DUMMY_PDF)
 
-        assert gate_result.passed is True
+        assert gate_result.passed is False
         assert len(gate_result.checks) == 1
         assert gate_result.checks[0].status == "soft_fail"
-        assert gate_result.checks[0].priority == "P2"
+        assert gate_result.checks[0].priority == "P1"
 
 
 # ---------------------------------------------------------------------------

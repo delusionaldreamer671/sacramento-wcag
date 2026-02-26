@@ -127,8 +127,8 @@ export function ReviewPanel({
     decision: ReviewerDecision,
     editContent?: string,
   ) {
-    setItems((prev) =>
-      prev.map((item) =>
+    setItems((prev) => {
+      const updated = prev.map((item) =>
         item.id === itemId
           ? {
               ...item,
@@ -138,18 +138,22 @@ export function ReviewPanel({
               reviewed_by: reviewerId,
             }
           : item,
-      ),
-    );
-    // Auto-advance to next pending item after a short delay
-    setTimeout(() => {
-      const nextPendingIndex = items.findIndex(
-        (item, idx) => idx > currentIndex && item.reviewer_decision === null,
       );
-      if (nextPendingIndex >= 0) {
-        setCurrentIndex(nextPendingIndex);
-        panelTopRef.current?.focus();
-      }
-    }, 800);
+
+      // Auto-advance to next pending item after a short delay.
+      // Use the freshly-computed `updated` list to avoid stale closure.
+      setTimeout(() => {
+        const nextPendingIndex = updated.findIndex(
+          (item, idx) => idx > currentIndex && item.reviewer_decision === null,
+        );
+        if (nextPendingIndex >= 0) {
+          setCurrentIndex(nextPendingIndex);
+          panelTopRef.current?.focus();
+        }
+      }, 800);
+
+      return updated;
+    });
   }
 
   // ----------------------------------------------------------------
@@ -249,8 +253,10 @@ export function ReviewPanel({
 
   if (!currentItem) return null;
 
+  // Prefer the explicit `criterion` field; fall back to `finding_id` for older records
+  const criterionCode = currentItem.criterion ?? currentItem.finding_id;
   const wcagLabel =
-    WCAG_CRITERION_LABELS[currentItem.finding_id as WCAGCriterion] ??
+    WCAG_CRITERION_LABELS[criterionCode] ??
     currentItem.element_type;
 
   return (
@@ -340,7 +346,7 @@ export function ReviewPanel({
       <div className="flex flex-wrap gap-2 px-1">
         <ElementTypeBadge type={currentItem.element_type} />
         <span className="inline-flex items-center rounded-full border border-border bg-muted px-2.5 py-0.5 text-xs text-muted-foreground">
-          WCAG {currentItem.finding_id} — {wcagLabel}
+          WCAG {criterionCode} — {wcagLabel}
         </span>
         {currentItem.reviewer_decision !== null && (
           <DecisionBadge decision={currentItem.reviewer_decision} />
@@ -494,12 +500,12 @@ function ElementTypeBadge({ type }: { type: string }) {
 }
 
 function DecisionBadge({ decision }: { decision: ReviewerDecision }) {
-  const map: Record<ReviewerDecision, { label: string; color: string }> = {
+  const map: Record<string, { label: string; color: string }> = {
     approve: { label: "Approved", color: "bg-green-100 text-green-800 border-green-200" },
     edit: { label: "Edited", color: "bg-amber-100 text-amber-800 border-amber-200" },
     reject: { label: "Rejected", color: "bg-red-100 text-red-800 border-red-200" },
   };
-  const { label, color } = map[decision];
+  const { label, color } = map[decision] ?? { label: decision ?? "Unknown", color: "bg-gray-100 text-gray-800 border-gray-200" };
 
   return (
     <span

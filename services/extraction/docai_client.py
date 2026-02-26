@@ -15,6 +15,7 @@ Setup:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from services.common.config import settings
@@ -102,10 +103,40 @@ class DocumentAIClient:
         )
 
         logger.info("Sending %d bytes to Document AI OCR", len(pdf_bytes))
-        result = self._client.process_document(request=request)
-        blocks = self._convert_to_ir_blocks(result.document)
-        logger.info("Document AI returned %d blocks", len(blocks))
-        return blocks
+
+        # CRITICAL-4.4: Add timeout and retry for transient 503 errors.
+        max_retries = 2
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 2):  # 1 initial + 2 retries
+            try:
+                result = self._client.process_document(
+                    request=request, timeout=180
+                )
+                blocks = self._convert_to_ir_blocks(result.document)
+                logger.info("Document AI returned %d blocks", len(blocks))
+                return blocks
+            except Exception as exc:
+                # Only retry on ServiceUnavailable (503) — transient error
+                exc_type_name = type(exc).__qualname__
+                is_503 = (
+                    "ServiceUnavailable" in exc_type_name
+                    or "503" in str(exc)
+                )
+                if is_503 and attempt <= max_retries:
+                    last_exc = exc
+                    wait = 2.0 ** attempt
+                    logger.warning(
+                        "Document AI attempt %d/%d failed (503). "
+                        "Retrying in %.1fs. Error: %s",
+                        attempt, max_retries + 1, wait, exc,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+
+        # Should not reach here, but satisfy type checker
+        assert last_exc is not None
+        raise last_exc
 
     def ocr_page(self, pdf_bytes: bytes, page_num: int) -> list[IRBlock]:
         """Run OCR and return blocks for a specific page only.

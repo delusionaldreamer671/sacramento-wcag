@@ -35,13 +35,24 @@ async function getInitialDocuments(): Promise<PDFDocument[]> {
     "http://localhost:8000";
 
   try {
-    const response = await fetch(`${baseUrl}/api/documents?skip=0&limit=20`, {
+    const response = await fetch(`${baseUrl}/api/v1/documents?skip=0&limit=20`, {
       headers: { Accept: "application/json" },
       next: { revalidate: 30 },
     });
 
     if (!response.ok) return [];
-    return (await response.json()) as PDFDocument[];
+    const raw = (await response.json()) as Array<Record<string, unknown>>;
+    // Normalise: backend returns document_id; frontend expects id
+    return raw.map((item) => ({
+      id: (item.document_id ?? item.id) as string,
+      filename: item.filename as string,
+      gcs_input_path: (item.gcs_input_path ?? "") as string,
+      gcs_output_path: (item.gcs_output_path ?? null) as string | null,
+      status: item.status as DocumentStatus,
+      page_count: (item.page_count ?? 0) as number,
+      created_at: item.created_at as string,
+      updated_at: item.updated_at as string,
+    }));
   } catch {
     return [];
   }

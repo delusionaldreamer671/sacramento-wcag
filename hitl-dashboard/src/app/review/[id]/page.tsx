@@ -1,31 +1,26 @@
+"use client";
+
 /**
- * Document review page — Server Component wrapper.
+ * Document review page.
  * Route: /review/[id]
  * Displays the ReviewPanel for a specific document.
  */
 
-import type { Metadata } from "next";
 import Link from "next/link";
 import { ReviewPanel } from "@/components/review-panel";
 import { ChangeProposalForm } from "@/components/change-proposal-form";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/lib/auth-context";
 
 interface ReviewPageProps {
   params: { id: string };
   searchParams?: { item?: string };
 }
 
-export async function generateMetadata({
-  params,
-}: ReviewPageProps): Promise<Metadata> {
-  return {
-    title: `Review Document ${params.id.slice(0, 8)} — WCAG Remediation Dashboard`,
-  };
-}
-
 export default function ReviewPage({ params, searchParams }: ReviewPageProps) {
   const documentId = params.id;
   const initialItemId = searchParams?.item;
+  const { userId } = useAuth();
 
   return (
     <div className="container mx-auto max-w-screen-xl px-4 py-6 space-y-6">
@@ -59,7 +54,7 @@ export default function ReviewPage({ params, searchParams }: ReviewPageProps) {
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
           Review AI-generated remediation suggestions. Use{" "}
-          <kbd className="kbd">←</kbd> / <kbd className="kbd">→</kbd> to
+          <kbd className="kbd">&larr;</kbd> / <kbd className="kbd">&rarr;</kbd> to
           navigate items, or{" "}
           <kbd className="kbd">Alt+A</kbd>{" "}
           <kbd className="kbd">Alt+E</kbd>{" "}
@@ -72,7 +67,7 @@ export default function ReviewPage({ params, searchParams }: ReviewPageProps) {
       <ReviewPanel
         documentId={documentId}
         initialItemId={initialItemId}
-        reviewerId="county-reviewer"
+        reviewerId={userId ?? "reviewer"}
       />
 
       {/* Change proposal section */}
@@ -88,7 +83,6 @@ export default function ReviewPage({ params, searchParams }: ReviewPageProps) {
             id="change-proposal-heading"
           >
             <span>Propose a Change to This Document</span>
-            {/* Chevron rotates when open */}
             <svg
               className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180"
               xmlns="http://www.w3.org/2000/svg"

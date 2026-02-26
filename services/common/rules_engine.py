@@ -230,10 +230,25 @@ class RulesEngine:
             return False
 
         if condition == "skip_level":
-            # Heading that jumps more than one level
+            # Heading that jumps more than one level.
+            # MEDIUM-5.18: prev_level must be present in the element's attributes
+            # for this rule to fire. If prev_level is absent, the rule is inert
+            # (defaults to level, gap = 0). Log a warning so operators know the
+            # rule is not producing matches — they must ensure the extraction
+            # pipeline populates prev_level on every heading element.
             try:
                 level = int(attributes.get("level", 0))
-                prev_level = int(attributes.get("prev_level", level))
+                raw_prev = attributes.get("prev_level")
+                if raw_prev is None:
+                    logger.warning(
+                        "_match_rule: skip_level rule triggered on heading "
+                        "(level=%d) but element has no 'prev_level' attribute — "
+                        "rule will not fire. Ensure the extraction pipeline sets "
+                        "'prev_level' on all heading elements.",
+                        level,
+                    )
+                    return False
+                prev_level = int(raw_prev)
             except (ValueError, TypeError):
                 return False
             return (level - prev_level) > 1

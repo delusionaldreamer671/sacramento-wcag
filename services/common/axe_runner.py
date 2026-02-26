@@ -97,9 +97,11 @@ def run_axe_scan(html_content: str) -> dict[str, Any]:
             page.set_content(html_content, wait_until="domcontentloaded")
 
             # Inject axe-core
-            page.evaluate(axe_script)
+            # MEDIUM-4.17: set timeout (ms) so evaluate() does not hang indefinitely.
+            # 30 seconds is generous for axe-core injection on any real document.
+            page.evaluate(axe_script, timeout=30_000)
 
-            # Run axe with WCAG 2.1 AA ruleset
+            # Run axe with WCAG 2.1 AA ruleset — 30-second timeout for analysis
             raw_results = page.evaluate("""() => {
                 return axe.run(document, {
                     runOnly: {
@@ -107,7 +109,7 @@ def run_axe_scan(html_content: str) -> dict[str, Any]:
                         values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']
                     }
                 });
-            }""")
+            }""", timeout=30_000)
         finally:
             browser.close()
 

@@ -264,7 +264,8 @@ def fix_cidset(pdf_bytes: bytes) -> tuple[bytes, ClauseFixResult]:
                     if cidset[0] != "null":
                         doc.xref_set_key(xref, "CIDSet", "null")
                         removed += 1
-            except Exception:
+            except Exception as exc:
+                logger.warning("fix_cidset: skipping xref %d due to error: %s", xref, exc)
                 continue
 
         result.before_state = f"{removed} font descriptors had /CIDSet"
@@ -371,8 +372,20 @@ class ClauseFixerPipeline:
                     # Update baseline for next fixer
                     if post_result:
                         baseline_errors = post_result.error_count
-                except Exception:
-                    pass  # On validation error, accept the fix
+                except Exception as verapdf_exc:
+                    # Reject the fix when validation is broken — accepting
+                    # unvalidated fixes is a fail-open anti-pattern.
+                    logger.warning(
+                        "VeraPDF validation error during fix acceptance check: %s — "
+                        "rejecting fix to prevent unvalidated changes", verapdf_exc,
+                    )
+                    fix_result.applied = False
+                    fix_result.error = (
+                        f"Rejected: VeraPDF validation failed ({verapdf_exc}). "
+                        "Cannot confirm fix doesn't increase errors."
+                    )
+                    results.append(fix_result)
+                    continue
 
             # Accept the fix
             current_bytes = fixed_bytes

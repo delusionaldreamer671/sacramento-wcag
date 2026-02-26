@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from services.common.gates import (
     GateCheck,
     GateResult,
     build_validation_ledger,
+    is_publishable,
     run_gate_g1,
     run_gate_g2,
     run_gate_g3,
+    run_gate_g4,
 )
 from services.common.ir import (
     BlockSource,
@@ -19,6 +23,15 @@ from services.common.ir import (
     IRDocument,
     IRPage,
 )
+
+
+def _pikepdf_available() -> bool:
+    """Check if pikepdf is importable (used for conditional test skipping)."""
+    try:
+        import pikepdf  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +272,368 @@ class TestGateModels:
     def test_gate_result_with_retries(self):
         result = GateResult(gate_id="G3", passed=False, checks=[], retry_count=2)
         assert result.retry_count == 2
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-5.20: _RE_IMG_EMPTY_SRC matches both quote styles
+# ---------------------------------------------------------------------------
+
+
+class TestImgEmptySrcQuoteStyles:
+    def test_empty_src_double_quotes_detected(self):
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1><img src="" alt="empty double"></main></body></html>'''
+        result = run_gate_g3(html)
+        src_checks = [c for c in result.checks if c.check_name == "img_src"]
+        assert len(src_checks) == 1
+        assert src_checks[0].status == "hard_fail"
+
+    def test_empty_src_single_quotes_detected(self):
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1><img src='' alt="empty single"></main></body></html>'''
+        result = run_gate_g3(html)
+        src_checks = [c for c in result.checks if c.check_name == "img_src"]
+        assert len(src_checks) == 1
+        assert src_checks[0].status == "hard_fail"
+
+    def test_valid_src_passes(self):
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1><img src="photo.png" alt="valid"></main></body></html>'''
+        result = run_gate_g3(html)
+        src_checks = [c for c in result.checks if c.check_name == "img_src"]
+        assert len(src_checks) == 0  # no img_src failure
+
+
+# ---------------------------------------------------------------------------
+# HIGH-5.9: G3 table header check — per-table granularity
+# ---------------------------------------------------------------------------
+
+
+class TestG3TableHeaderPerTable:
+    def test_single_table_with_headers_passes(self):
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1>
+<table><thead><tr><th scope="col">A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>
+</main></body></html>'''
+        result = run_gate_g3(html)
+        th_checks = [c for c in result.checks if c.check_name == "table_headers"]
+        assert len(th_checks) == 1
+        assert th_checks[0].status == "pass"
+        assert "1 table" in th_checks[0].details
+
+    def test_single_table_without_headers_fails(self):
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1>
+<table><tr><td>No headers</td></tr></table>
+</main></body></html>'''
+        result = run_gate_g3(html)
+        th_checks = [c for c in result.checks if c.check_name == "table_headers"]
+        assert len(th_checks) == 1
+        assert th_checks[0].status == "hard_fail"
+
+    def test_multi_table_one_missing_headers_fails(self):
+        """Two tables: one with headers, one without. Gate should fail."""
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1>
+<table><thead><tr><th scope="col">Good</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>
+<table><tr><td>No headers here</td></tr></table>
+</main></body></html>'''
+        result = run_gate_g3(html)
+        th_checks = [c for c in result.checks if c.check_name == "table_headers"]
+        assert len(th_checks) == 1
+        assert th_checks[0].status == "hard_fail"
+        assert "1 of 2" in th_checks[0].details
+
+    def test_multi_table_all_headers_passes(self):
+        """Two tables both with proper headers. Gate should pass."""
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1>
+<table><thead><tr><th scope="col">A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>
+<table><thead><tr><th scope="row">B</th><td>2</td></tr></thead></table>
+</main></body></html>'''
+        result = run_gate_g3(html)
+        th_checks = [c for c in result.checks if c.check_name == "table_headers"]
+        assert len(th_checks) == 1
+        assert th_checks[0].status == "pass"
+        assert "2 table" in th_checks[0].details
+
+    def test_no_tables_no_check(self):
+        """When no tables present, no table_headers check should appear."""
+        html = '''<!DOCTYPE html>
+<html lang="en"><head><title>T</title></head>
+<body><main><h1>Title</h1><p>No tables here.</p></main></body></html>'''
+        result = run_gate_g3(html)
+        th_checks = [c for c in result.checks if c.check_name == "table_headers"]
+        assert len(th_checks) == 0
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL-5.4: G4 fallback — pikepdf-based PDF/UA checks
+# ---------------------------------------------------------------------------
+
+
+class TestG4FallbackPikepdf:
+    """Test that G4 fallback with pikepdf checks /StructTreeRoot, /MarkInfo, /Lang."""
+
+    def _make_tagged_pdf(self) -> bytes:
+        """Create a minimal tagged PDF with /StructTreeRoot, /MarkInfo, /Lang."""
+        import pikepdf
+        import io
+
+        pdf = pikepdf.new()
+        pdf.add_blank_page(page_size=(612, 792))
+        # Add /StructTreeRoot (minimal)
+        struct_tree = pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+        }))
+        pdf.Root["/StructTreeRoot"] = struct_tree
+        # Add /MarkInfo
+        pdf.Root["/MarkInfo"] = pdf.make_indirect(pikepdf.Dictionary({
+            "/Marked": True,
+        }))
+        # Add /Lang
+        pdf.Root["/Lang"] = pikepdf.String("en")
+
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def _make_untagged_pdf(self) -> bytes:
+        """Create a minimal PDF without /StructTreeRoot, /MarkInfo, /Lang."""
+        import pikepdf
+        import io
+
+        pdf = pikepdf.new()
+        pdf.add_blank_page(page_size=(612, 792))
+
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    @pytest.mark.skipif(
+        not _pikepdf_available(), reason="pikepdf not installed"
+    )
+    def test_g4_fallback_tagged_pdf_passes(self):
+        """G4 fallback should pass for a properly tagged PDF."""
+        # Mock Adobe as unavailable to force fallback
+        with patch("services.common.gates._run_adobe_checker") as mock_adobe:
+            mock_adobe.return_value = [GateCheck(
+                gate_id="G4", check_name="adobe_checker_unavailable",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="Adobe not configured",
+            )]
+            pdf_bytes = self._make_tagged_pdf()
+            result = run_gate_g4(pdf_bytes)
+
+        # Should find /StructTreeRoot, /MarkInfo, /Lang checks all passing
+        struct_checks = [c for c in result.checks if c.check_name == "pdf_struct_tree_root"]
+        assert len(struct_checks) == 1
+        assert struct_checks[0].status == "pass"
+
+        mark_checks = [c for c in result.checks if c.check_name == "pdf_mark_info"]
+        assert len(mark_checks) == 1
+        assert mark_checks[0].status == "pass"
+
+        lang_checks = [c for c in result.checks if c.check_name == "pdf_lang"]
+        assert len(lang_checks) == 1
+        assert lang_checks[0].status == "pass"
+
+    @pytest.mark.skipif(
+        not _pikepdf_available(), reason="pikepdf not installed"
+    )
+    def test_g4_fallback_untagged_pdf_fails(self):
+        """G4 fallback should hard_fail for an untagged PDF."""
+        with patch("services.common.gates._run_adobe_checker") as mock_adobe:
+            mock_adobe.return_value = [GateCheck(
+                gate_id="G4", check_name="adobe_checker_unavailable",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="Adobe not configured",
+            )]
+            pdf_bytes = self._make_untagged_pdf()
+            result = run_gate_g4(pdf_bytes)
+
+        # Should fail on missing /StructTreeRoot
+        struct_checks = [c for c in result.checks if c.check_name == "pdf_struct_tree_root"]
+        assert len(struct_checks) == 1
+        assert struct_checks[0].status == "hard_fail"
+        assert struct_checks[0].priority == "P0"
+
+        # Should fail on missing /Lang
+        lang_checks = [c for c in result.checks if c.check_name == "pdf_lang"]
+        assert len(lang_checks) == 1
+        assert lang_checks[0].status == "hard_fail"
+
+        # Overall gate should fail
+        assert result.passed is False
+
+    def test_g4_fallback_no_pikepdf_no_adobe_hard_fails(self):
+        """When both Adobe and pikepdf unavailable, gate must hard_fail."""
+        with patch("services.common.gates._run_adobe_checker") as mock_adobe:
+            mock_adobe.return_value = [GateCheck(
+                gate_id="G4", check_name="adobe_checker_unavailable",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="Adobe not configured",
+            )]
+            # Mock pikepdf as unavailable
+            import sys
+            pikepdf_module = sys.modules.get("pikepdf")
+            sys.modules["pikepdf"] = None  # type: ignore[assignment]
+            try:
+                # Need a valid PDF for pypdf to parse
+                import io
+                from pypdf import PdfWriter
+                writer = PdfWriter()
+                writer.add_blank_page(width=612, height=792)
+                buf = io.BytesIO()
+                writer.write(buf)
+                pdf_bytes = buf.getvalue()
+
+                result = run_gate_g4(pdf_bytes)
+            finally:
+                if pikepdf_module is not None:
+                    sys.modules["pikepdf"] = pikepdf_module
+                else:
+                    del sys.modules["pikepdf"]
+
+        # Should have a hard_fail for no validator
+        no_validator = [c for c in result.checks if c.check_name == "pdf_no_validator"]
+        assert len(no_validator) == 1
+        assert no_validator[0].status == "hard_fail"
+        assert no_validator[0].priority == "P0"
+        assert result.passed is False
+
+
+# ---------------------------------------------------------------------------
+# HIGH-5.13: is_publishable — VeraPDF unavailability bypass when Adobe passed
+# ---------------------------------------------------------------------------
+
+
+class TestIsPublishableVeraPDFBypass:
+    def test_verapdf_unavail_blocks_without_adobe(self):
+        """VeraPDF P1 unavailability blocks when Adobe did NOT pass."""
+        verapdf_result = GateResult(
+            gate_id="G4-VeraPDF", passed=False,
+            checks=[GateCheck(
+                gate_id="G4-VeraPDF", check_name="verapdf_available",
+                status="soft_fail", severity="moderate",
+                priority="P1", next_action="flag_hitl",
+                details="VeraPDF container not reachable — PDF/UA-1 validation SKIPPED (status: unavailable)",
+            )],
+        )
+        # No adobe_checker_pass in G4
+        g4_result = GateResult(
+            gate_id="G4", passed=True,
+            checks=[GateCheck(
+                gate_id="G4", check_name="pdf_has_pages",
+                status="pass", severity="minor",
+                priority="P2", next_action="proceed",
+                details="PDF has 5 pages",
+            )],
+        )
+        publishable, reason = is_publishable([g4_result, verapdf_result])
+        assert publishable is False
+        assert "P1" in reason
+
+    def test_verapdf_unavail_does_not_block_when_adobe_passed(self):
+        """VeraPDF P1 unavailability does NOT block when Adobe G4 explicitly passed."""
+        verapdf_result = GateResult(
+            gate_id="G4-VeraPDF", passed=False,
+            checks=[GateCheck(
+                gate_id="G4-VeraPDF", check_name="verapdf_available",
+                status="soft_fail", severity="moderate",
+                priority="P1", next_action="flag_hitl",
+                details="VeraPDF container not reachable — PDF/UA-1 validation SKIPPED (status: unavailable)",
+            )],
+        )
+        # Adobe G4 explicitly passed
+        g4_result = GateResult(
+            gate_id="G4", passed=True,
+            checks=[GateCheck(
+                gate_id="G4", check_name="adobe_checker_pass",
+                status="pass", severity="minor",
+                priority="P2", next_action="proceed",
+                details="Adobe PDF Accessibility Checker: compliant",
+            )],
+        )
+        publishable, reason = is_publishable([g4_result, verapdf_result])
+        assert publishable is True
+        assert "publishable" in reason.lower()
+
+    def test_verapdf_real_failure_still_blocks_with_adobe(self):
+        """VeraPDF real compliance P1 failures still block even when Adobe passed."""
+        verapdf_result = GateResult(
+            gate_id="G4-VeraPDF", passed=False,
+            checks=[GateCheck(
+                gate_id="G4-VeraPDF", check_name="clause_7.1",
+                status="soft_fail", severity="serious",
+                priority="P1", next_action="flag_hitl",
+                details="Clause 7.1: General requirements (3 failures)",
+            )],
+        )
+        g4_result = GateResult(
+            gate_id="G4", passed=True,
+            checks=[GateCheck(
+                gate_id="G4", check_name="adobe_checker_pass",
+                status="pass", severity="minor",
+                priority="P2", next_action="proceed",
+                details="Adobe PDF Accessibility Checker: compliant",
+            )],
+        )
+        publishable, reason = is_publishable([g4_result, verapdf_result])
+        assert publishable is False
+        assert "P1" in reason
+
+
+# ---------------------------------------------------------------------------
+# HIGH-2.7/2.8: Exception specificity — Python bugs should propagate
+# ---------------------------------------------------------------------------
+
+
+class TestExceptionSpecificity:
+    def test_axe_type_error_propagates(self):
+        """TypeError in axe runner should NOT be caught (programming bug)."""
+        with patch("services.common.gates._run_axe_checks") as mock_axe:
+            mock_axe.side_effect = TypeError("unexpected type in axe code")
+            with pytest.raises(TypeError, match="unexpected type"):
+                run_gate_g3("<html lang='en'><body></body></html>")
+
+    def test_axe_import_error_caught_as_soft_fail(self):
+        """ImportError in axe runner should be caught as soft_fail, not crash."""
+        from services.common.gates import _run_axe_checks
+
+        # Simulate the axe_runner import failing with ImportError
+        with patch.dict("sys.modules", {"services.common.axe_runner": None}):
+            checks = _run_axe_checks("<html></html>")
+        # Should produce a soft_fail check, not crash
+        assert any(c.status == "soft_fail" for c in checks)
+
+    def test_adobe_type_error_propagates(self):
+        """TypeError in Adobe checker should NOT be caught (programming bug)."""
+        from services.common.gates import _run_adobe_checker
+
+        # Patch config.settings to indicate Adobe is configured
+        mock_settings = MagicMock()
+        mock_settings.adobe_client_id = "test-id"
+        mock_settings.adobe_checker_enabled = True
+
+        with patch.dict("sys.modules", {
+            "services.common.config": MagicMock(settings=mock_settings),
+        }):
+            # Patch the adobe_checker module to raise TypeError on import
+            mock_checker_module = MagicMock()
+            mock_checker_module.AdobeAccessibilityChecker.side_effect = TypeError("bug in checker")
+            with patch.dict("sys.modules", {
+                "services.extraction.adobe_checker": mock_checker_module,
+            }):
+                with pytest.raises(TypeError, match="bug in checker"):
+                    _run_adobe_checker(b"%PDF-test")
