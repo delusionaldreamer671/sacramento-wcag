@@ -31,7 +31,7 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_LEFT
-from reportlab.pdfbase.pdfdoc import PDFDictionary, PDFtrue, XMP
+from reportlab.pdfbase.pdfdoc import PDFDictionary, PDFStream, PDFtrue
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -89,11 +89,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _make_xmp_content(title: str, lang: str):
-    """Return an XMP ``creator`` callable for use with ``reportlab.pdfbase.pdfdoc.XMP``.
+def _make_xmp_stream(title: str, lang: str) -> PDFStream:
+    """Return a PDFStream containing XMP metadata for PDF/UA-1 compliance.
 
-    The returned function accepts a reportlab ``PDFDocument`` and returns an
-    XMP metadata packet (bytes) that sets:
+    The XMP packet sets:
 
     - ``dc:title``        — document title (ISO 14289-1 §7.1)
     - ``dc:language``     — BCP-47 language tag (ISO 14289-1 §7.2)
@@ -105,25 +104,26 @@ def _make_xmp_content(title: str, lang: str):
     _title_escaped = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     _lang_escaped = lang.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    def _creator(doc: Any) -> bytes:  # noqa: ARG001  (doc unused but required by XMP API)
-        packet = (
-            '<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
-            '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
-            '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
-            '<rdf:Description rdf:about="" '
-            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-            'xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/">'
-            f'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">{_title_escaped}</rdf:li></rdf:Alt></dc:title>'
-            f'<dc:language><rdf:Bag><rdf:li>{_lang_escaped}</rdf:li></rdf:Bag></dc:language>'
-            '<pdfuaid:part>1</pdfuaid:part>'
-            '</rdf:Description>'
-            '</rdf:RDF>'
-            '</x:xmpmeta>'
-            '<?xpacket end="w"?>'
-        )
-        return packet.encode("utf-8")
-
-    return _creator
+    packet = (
+        '<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/">'
+        f'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">{_title_escaped}</rdf:li></rdf:Alt></dc:title>'
+        f'<dc:language><rdf:Bag><rdf:li>{_lang_escaped}</rdf:li></rdf:Bag></dc:language>'
+        '<pdfuaid:part>1</pdfuaid:part>'
+        '</rdf:Description>'
+        '</rdf:RDF>'
+        '</x:xmpmeta>'
+        '<?xpacket end="w"?>'
+    )
+    xmp_bytes = packet.encode("utf-8")
+    stream = PDFStream(content=xmp_bytes)
+    stream.dictionary["Type"] = "/Metadata"
+    stream.dictionary["Subtype"] = "/XML"
+    return stream
 
 
 # ---------------------------------------------------------------------------
@@ -932,10 +932,9 @@ class PDFUABuilder:
             # with the pdfuaid:part property set to 1.  Without this, validators
             # that implement ISO 14289-1 §6.7.11 will flag the document even if
             # /MarkInfo and /Lang are present.
-            xmp_content = _make_xmp_content(_title, _lang)
-            xmp = XMP(creator=xmp_content)
-            catalog.Metadata = xmp
-            pdf_doc.Reference(xmp)
+            xmp_stream = _make_xmp_stream(_title, _lang)
+            catalog.Metadata = xmp_stream
+            pdf_doc.Reference(xmp_stream)
 
         try:
             doc.build(
@@ -1265,9 +1264,9 @@ class PDFUABuilder:
             pdf_doc = canvas_obj._doc
             catalog = pdf_doc.Catalog
             catalog.MarkInfo = PDFDictionary({"Marked": PDFtrue})
-            xmp = XMP(creator=_make_xmp_content(_title, _lang))
-            catalog.Metadata = xmp
-            pdf_doc.Reference(xmp)
+            xmp_stream = _make_xmp_stream(_title, _lang)
+            catalog.Metadata = xmp_stream
+            pdf_doc.Reference(xmp_stream)
 
         doc.build(story, onFirstPage=_apply_catalog, onLaterPages=_apply_catalog)
         return buffer.getvalue()
