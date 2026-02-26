@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from services.common import gcs_client, pubsub_client
 from services.common.config import settings
+from services.common.constants import API_V1_PREFIX
 from services.common.database import get_db
 from services.common.ir import BlockType, IRDocument, ValidationMode
 from services.ingestion.converter import ValidationBlockedError
@@ -38,7 +39,26 @@ from services.common.wcag_techniques import get_techniques_for_criterion, get_fa
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix=API_V1_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# Concurrency guard
+# ---------------------------------------------------------------------------
+
+
+async def _acquire_pipeline_semaphore() -> None:
+    """Acquire the pipeline concurrency semaphore or raise 503."""
+    from services.ingestion.main import get_pipeline_semaphore
+
+    sem = get_pipeline_semaphore()
+    acquired = sem._value > 0  # Check without acquiring
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="Server at maximum document processing capacity. Retry later.",
+            headers={"Retry-After": "30"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -460,26 +480,29 @@ async def convert_document(
     )
 
     from services.ingestion.converter import convert_pdf_sync
+    from services.ingestion.main import get_pipeline_semaphore
 
     task_id = ""
+    sem = get_pipeline_semaphore()
 
     if output_format == "zip":
         # Generate both HTML and PDF, then bundle them into a ZIP archive.
         try:
-            html_bytes, _, task_id = await asyncio.to_thread(
-                convert_pdf_sync,
-                contents,
-                filename,
-                "html",
-                validation_mode=mode,
-            )
-            pdf_bytes, _, _ = await asyncio.to_thread(
-                convert_pdf_sync,
-                contents,
-                filename,
-                "pdf",
-                validation_mode=mode,
-            )
+            async with sem:
+                html_bytes, _, task_id = await asyncio.to_thread(
+                    convert_pdf_sync,
+                    contents,
+                    filename,
+                    "html",
+                    validation_mode=mode,
+                )
+                pdf_bytes, _, _ = await asyncio.to_thread(
+                    convert_pdf_sync,
+                    contents,
+                    filename,
+                    "pdf",
+                    validation_mode=mode,
+                )
         except ValidationBlockedError as exc:
             logger.warning(
                 "Validation blocked output for %s: %s", filename, exc,
@@ -507,13 +530,14 @@ async def convert_document(
         disposition = f'attachment; filename="{stem}_remediated.zip"'
     else:
         try:
-            output_bytes, content_type, task_id = await asyncio.to_thread(
-                convert_pdf_sync,
-                contents,
-                filename,
-                output_format,
-                validation_mode=mode,
-            )
+            async with sem:
+                output_bytes, content_type, task_id = await asyncio.to_thread(
+                    convert_pdf_sync,
+                    contents,
+                    filename,
+                    output_format,
+                    validation_mode=mode,
+                )
         except ValidationBlockedError as exc:
             logger.warning(
                 "Validation blocked output for %s: %s", filename, exc,
@@ -971,9 +995,11 @@ async def analyze_document(
     )
 
     from services.ingestion.converter import stage_extract
+    from services.ingestion.main import get_pipeline_semaphore
 
     try:
-        ir_doc = await asyncio.to_thread(stage_extract, contents, filename)
+        async with get_pipeline_semaphore():
+            ir_doc = await asyncio.to_thread(stage_extract, contents, filename)
     except Exception as exc:
         logger.exception("Extraction failed for %s", filename)
         raise HTTPException(
@@ -1220,16 +1246,18 @@ async def remediate_document(
     )
 
     from services.ingestion.converter import convert_pdf_sync
+    from services.ingestion.main import get_pipeline_semaphore
 
     try:
-        output_bytes, content_type, task_id = await asyncio.to_thread(
-            convert_pdf_sync,
-            contents,
-            filename,
-            output_format,
-            validation_mode=mode,
-            approved_ids=approved_set,
-        )
+        async with get_pipeline_semaphore():
+            output_bytes, content_type, task_id = await asyncio.to_thread(
+                convert_pdf_sync,
+                contents,
+                filename,
+                output_format,
+                validation_mode=mode,
+                approved_ids=approved_set,
+            )
     except ValidationBlockedError as exc:
         logger.warning(
             "Unexpected validation block for %s: %s", filename, exc,

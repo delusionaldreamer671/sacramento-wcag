@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-router = APIRouter(prefix="/api", tags=["fixes"])
+from services.common.constants import API_V1_PREFIX
+
+router = APIRouter(prefix=API_V1_PREFIX, tags=["fixes"])
 
 # In-memory cache for sync conversions (populated by convert_pdf_sync)
 _SYNC_EVENT_CACHE: dict[str, list[dict]] = {}

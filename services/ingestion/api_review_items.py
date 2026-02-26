@@ -19,11 +19,12 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from services.common.config import settings
+from services.common.constants import API_V1_PREFIX
 from services.common.database import get_db
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api", tags=["review-items"])
+router = APIRouter(prefix=API_V1_PREFIX, tags=["review-items"])
 
 
 # ---------------------------------------------------------------------------

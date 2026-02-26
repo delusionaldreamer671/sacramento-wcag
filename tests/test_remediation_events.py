@@ -5,7 +5,7 @@ Covers:
   - RemediationEvent field defaults (id, timestamp, source)
   - RemediationEventCollector record / events / to_dict_list / persist_to_db
   - Database.insert_remediation_event / get_remediation_events (SQLite round-trip)
-  - GET /api/{task_id}/fixes-applied endpoint (cache hit, cache miss, DB fallback)
+  - GET /api/v1/{task_id}/fixes-applied endpoint (cache hit, cache miss, DB fallback)
 """
 
 from __future__ import annotations
@@ -387,7 +387,7 @@ class TestAPIEndpointFromCache:
         ]
         api_fixes_module.cache_events(task_id, events)
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         assert response.status_code == 200
 
         data = response.json()
@@ -403,7 +403,7 @@ class TestAPIEndpointFromCache:
         task_id = "task-id-check-abc123"
         api_fixes_module.cache_events(task_id, [{"component": "MarkInfo"}])
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         assert response.status_code == 200
         assert response.json()["task_id"] == task_id
 
@@ -414,7 +414,7 @@ class TestAPIEndpointFromCache:
         events = [{"id": f"e{i}"} for i in range(5)]
         api_fixes_module.cache_events(task_id, events)
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         data = response.json()
         assert data["event_count"] == len(data["events"])
 
@@ -426,7 +426,7 @@ class TestAPIEndpointFromCache:
         api_fixes_module.cache_events(task_id, [{"id": "old"}])
         api_fixes_module.cache_events(task_id, [{"id": "new-1"}, {"id": "new-2"}])
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         data = response.json()
         assert data["event_count"] == 2
         assert data["events"][0]["id"] == "new-1"
@@ -443,7 +443,7 @@ class TestAPIEndpointCacheMiss:
         client, _ = api_client
         task_id = f"task-unknown-{uuid.uuid4()}"
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         # The endpoint raises HTTPException(404) when neither cache nor DB has events
         assert response.status_code == 404
 
@@ -452,7 +452,7 @@ class TestAPIEndpointCacheMiss:
         client, _ = api_client
         task_id = "task-missing-xyz"
 
-        response = client.get(f"/api/{task_id}/fixes-applied")
+        response = client.get(f"/api/v1/{task_id}/fixes-applied")
         assert response.status_code == 404
         detail = response.json().get("detail", "")
         assert task_id in detail

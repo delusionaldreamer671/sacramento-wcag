@@ -89,6 +89,14 @@ def init_telemetry(app: FastAPI) -> None:
 
         trace.set_tracer_provider(_tracer_provider)
 
+        # Bridge OTel trace context into Python log records
+        try:
+            from opentelemetry.instrumentation.logging import LoggingInstrumentor
+            LoggingInstrumentor().instrument(set_logging_format=False)
+            logger.info("OTel log bridge enabled (trace_id/span_id injected into log records)")
+        except Exception as log_exc:
+            logger.warning("OTel log bridge failed (%s), logs won't have trace_id", log_exc)
+
         # Auto-instrument FastAPI
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
         FastAPIInstrumentor.instrument_app(

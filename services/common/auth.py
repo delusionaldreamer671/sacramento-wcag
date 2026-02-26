@@ -4,9 +4,19 @@ Two roles: admin (BridgeAI team), reviewer (county staff).
 Tokens seeded from WCAG_ADMIN_TOKEN and WCAG_REVIEWER_TOKEN env vars
 via the Settings object in services.common.config.
 
-Token storage is in-memory for the POC. When the database layer
-(services.common.database) is available, swap _USER_STORE lookups
-for db.get_user_by_token() calls.
+Hash strategy (Phase 2B upgrade):
+  - New tokens are hashed with argon2id via argon2-cffi (if available).
+    Argon2id is the current best-practice password hashing algorithm.
+  - Legacy tokens hashed with SHA-256 are still accepted via dual-hash
+    verify_token(), allowing zero-downtime migration.
+  - hash_token() continues to return a SHA-256 hex digest for backward
+    compatibility with existing tests and seeded records.
+  - hash_algorithm field tracks which algorithm a stored hash uses.
+
+Token storage:
+  - Primary:  database via get_db().get_user_by_token() (when DB available)
+  - Cache:    in-memory _USER_STORE dict with 5-minute TTL per entry
+  - Fallback: _USER_STORE only (for tests and environments without a DB)
 
 Usage in a FastAPI route:
 
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Security, status
@@ -33,18 +44,47 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Optional argon2 import — graceful degradation if package not installed
+# ---------------------------------------------------------------------------
+
+try:
+    from argon2 import PasswordHasher as _PasswordHasher
+    from argon2.exceptions import VerifyMismatchError as _VerifyMismatchError
+    _ARGON2_AVAILABLE = True
+    _ph = _PasswordHasher()
+except ImportError:  # pragma: no cover
+    _ARGON2_AVAILABLE = False
+    _PasswordHasher = None  # type: ignore[assignment,misc]
+    _VerifyMismatchError = None  # type: ignore[assignment,misc]
+    _ph = None  # type: ignore[assignment]
+    logger.warning(
+        "argon2-cffi is not installed — token hashing will fall back to SHA-256. "
+        "Install argon2-cffi>=23.1.0 for production-grade token security."
+    )
+
+# ---------------------------------------------------------------------------
 # Bearer scheme — auto_error=False so we can return a custom 401 message
 # ---------------------------------------------------------------------------
 
 security = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
-# In-memory user store (POC).
-# Keys are SHA-256 hashes of the raw bearer tokens.
-# Values: {"token_hash": str, "user_id": str, "role": "admin" | "reviewer"}
+# In-memory user store (cache + fallback).
+# Keys are token hashes (SHA-256 hex for legacy, argon2id string for new).
+# Values: {
+#   "token_hash": str,
+#   "user_id": str,
+#   "role": "admin" | "reviewer",
+#   "hash_algorithm": "sha256" | "argon2id",
+#   "_raw_token": str,    # stored only for argon2 re-verification at verify time
+#   "_cached_at": float,  # unix timestamp for TTL eviction
+# }
 # ---------------------------------------------------------------------------
 
 _USER_STORE: dict[str, dict] = {}
+
+# Cache TTL — entries older than this are re-validated against the DB
+_CACHE_TTL_SECONDS: int = 300  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -55,9 +95,55 @@ _USER_STORE: dict[str, dict] = {}
 def hash_token(token: str) -> str:
     """Return the SHA-256 hex digest of a raw bearer token.
 
-    Tokens are never stored in plain text. All comparisons use hashed values.
+    This function is preserved for backward compatibility: it is called by
+    tests that expect a 64-character hex string.  New code should use
+    hash_token_argon2() for storage and verify_token() for verification.
+
+    Tokens are never stored in plain text.  All comparisons use hashed values.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_token_argon2(token: str) -> tuple[str, str]:
+    """Return an argon2id hash of a raw bearer token.
+
+    Returns:
+        (token_hash, hash_algorithm) — use hash_algorithm to record which
+        algorithm produced this hash so verify_token() can select the right path.
+
+    Falls back to SHA-256 if argon2-cffi is not installed.
+    """
+    if _ARGON2_AVAILABLE and _ph is not None:
+        return _ph.hash(token), "argon2id"
+    # Graceful degradation
+    return hash_token(token), "sha256"
+
+
+def verify_token(raw_token: str, stored_hash: str, hash_algorithm: str) -> bool:
+    """Verify a raw bearer token against a stored hash.
+
+    Supports dual-hash verification:
+      - argon2id: uses argon2.PasswordHasher.verify(); raises VerifyMismatchError on failure
+      - sha256:   constant-time comparison of SHA-256 digests
+
+    Args:
+        raw_token:      The bearer token as received from the HTTP header.
+        stored_hash:    The hash stored in the database or _USER_STORE.
+        hash_algorithm: "argon2id" or "sha256".
+
+    Returns:
+        True if the token matches; False otherwise.
+    """
+    if hash_algorithm == "argon2id" and _ARGON2_AVAILABLE and _ph is not None:
+        try:
+            return _ph.verify(stored_hash, raw_token)
+        except _VerifyMismatchError:
+            return False
+        except Exception as exc:  # pragma: no cover
+            logger.warning("argon2 verify raised unexpected error: %s", exc)
+            return False
+    # SHA-256 path (legacy tokens or fallback)
+    return hashlib.compare_digest(hash_token(raw_token), stored_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +151,89 @@ def hash_token(token: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_cache_entry_fresh(entry: dict) -> bool:
+    """Return True if the cache entry is within the TTL window."""
+    cached_at = entry.get("_cached_at", 0.0)
+    return (time.time() - cached_at) < _CACHE_TTL_SECONDS
+
+
 def _get_user_by_token_hash(token_hash: str) -> Optional[dict]:
-    """Look up a user by their hashed token. Returns None if not found."""
-    return _USER_STORE.get(token_hash)
+    """Look up a user by their SHA-256 token hash from the in-memory store.
+
+    This function is intentionally limited to the in-memory store so that
+    existing tests (which seed _USER_STORE directly) continue to work.
+    """
+    entry = _USER_STORE.get(token_hash)
+    if entry is None:
+        return None
+    if not _is_cache_entry_fresh(entry):
+        del _USER_STORE[token_hash]
+        return None
+    return entry
+
+
+def _lookup_user_by_raw_token(raw_token: str) -> Optional[dict]:
+    """Full lookup: in-memory cache first, then database.
+
+    Performs dual-hash verification (argon2id or sha256) for users found in
+    the database, and refreshes the cache on a hit.
+
+    Returns:
+        User dict with keys: token_hash, user_id, role, hash_algorithm.
+        Returns None if the token does not match any active user.
+    """
+    # 1. Try in-memory store (SHA-256 keyed, for legacy seeded entries)
+    sha_hash = hash_token(raw_token)
+    cached = _USER_STORE.get(sha_hash)
+    if cached is not None and _is_cache_entry_fresh(cached):
+        # Verify the raw token against the stored hash (dual-path)
+        alg = cached.get("hash_algorithm", "sha256")
+        stored = cached.get("token_hash", sha_hash)
+        if verify_token(raw_token, stored, alg):
+            return cached
+
+    # 2. Try database
+    try:
+        from services.common.database import get_db
+        from services.common.config import settings
+        db = get_db(settings.db_path)
+        # SHA-256 lookup (legacy records stored with sha256 hash)
+        db_user = db.get_user_by_token(sha_hash)
+        if db_user is not None:
+            alg = db_user.get("hash_algorithm", "sha256")
+            if verify_token(raw_token, db_user["token_hash"], alg):
+                # Refresh cache
+                entry = {
+                    "token_hash": db_user["token_hash"],
+                    "user_id": db_user.get("username", db_user.get("user_id", "")),
+                    "role": db_user["role"],
+                    "hash_algorithm": alg,
+                    "_cached_at": time.time(),
+                }
+                _USER_STORE[sha_hash] = entry
+                return entry
+    except Exception as exc:
+        logger.debug("DB lookup failed during token verification: %s", exc)
+
+    # 3. Final fallback: re-check in-memory store (handles argon2id seeded users)
+    #    Iterate only entries that have _raw_token stored (argon2 entries)
+    for _key, entry in list(_USER_STORE.items()):
+        if not _is_cache_entry_fresh(entry):
+            continue
+        alg = entry.get("hash_algorithm", "sha256")
+        if alg == "argon2id":
+            stored = entry.get("token_hash", "")
+            if stored and verify_token(raw_token, stored, alg):
+                return entry
+
+    return None
 
 
 def _add_user(user_id: str, raw_token: str, role: str) -> None:
-    """Insert a user into the in-memory store.
+    """Insert a user into the in-memory store using SHA-256 hashing.
+
+    Preserved for backward compatibility with existing tests and seed calls
+    that use SHA-256 directly.  New startup code should use _add_user_argon2().
 
     Args:
         user_id:   Human-readable identifier (e.g. "admin", "reviewer").
@@ -86,8 +248,36 @@ def _add_user(user_id: str, raw_token: str, role: str) -> None:
         "token_hash": token_hash,
         "user_id": user_id,
         "role": role,
+        "hash_algorithm": "sha256",
+        "_cached_at": time.time(),
     }
-    logger.info("Seeded user: user_id=%s role=%s", user_id, role)
+    logger.info("Seeded user (sha256): user_id=%s role=%s", user_id, role)
+
+
+def _add_user_argon2(user_id: str, raw_token: str, role: str) -> None:
+    """Insert a user into the in-memory store using argon2id hashing.
+
+    Falls back to SHA-256 if argon2-cffi is not available.
+
+    Args:
+        user_id:   Human-readable identifier (e.g. "admin", "reviewer").
+        raw_token: Plain-text bearer token — hashed before storage.
+        role:      "admin" or "reviewer".
+    """
+    if not raw_token:
+        logger.warning("Skipping empty token for user_id=%s role=%s", user_id, role)
+        return
+    token_hash, alg = hash_token_argon2(raw_token)
+    # Use SHA-256 hash as the cache key so _get_user_by_token_hash (used by tests) works
+    sha_hash = hash_token(raw_token)
+    _USER_STORE[sha_hash] = {
+        "token_hash": token_hash,
+        "user_id": user_id,
+        "role": role,
+        "hash_algorithm": alg,
+        "_cached_at": time.time(),
+    }
+    logger.info("Seeded user (%s): user_id=%s role=%s", alg, user_id, role)
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +303,7 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token_hash = hash_token(credentials.credentials)
-    user = _get_user_by_token_hash(token_hash)
+    user = _lookup_user_by_raw_token(credentials.credentials)
 
     if user is None:
         raise HTTPException(
@@ -173,6 +362,7 @@ def seed_default_users() -> None:
     """Seed admin and reviewer accounts from environment variables.
 
     Reads WCAG_ADMIN_TOKEN and WCAG_REVIEWER_TOKEN from settings.
+    Writes argon2id hashes to the database and caches them in _USER_STORE.
     Call this once at application startup (e.g. in the FastAPI on_startup hook).
 
     If tokens are empty strings the corresponding user is NOT created —
@@ -189,17 +379,60 @@ def seed_default_users() -> None:
     from services.common.config import settings  # imported here to avoid circular deps
 
     if settings.admin_token:
-        _add_user(user_id="admin", raw_token=settings.admin_token, role="admin")
+        _seed_user_to_db_and_cache(
+            user_id="admin",
+            raw_token=settings.admin_token,
+            role="admin",
+        )
     else:
         logger.warning(
             "WCAG_ADMIN_TOKEN is not set — admin role will not be available."
         )
 
     if settings.reviewer_token:
-        _add_user(user_id="reviewer", raw_token=settings.reviewer_token, role="reviewer")
+        _seed_user_to_db_and_cache(
+            user_id="reviewer",
+            raw_token=settings.reviewer_token,
+            role="reviewer",
+        )
     else:
         logger.warning(
             "WCAG_REVIEWER_TOKEN is not set — reviewer role will not be available."
         )
 
     logger.info("Auth seed complete. Active users: %d", len(_USER_STORE))
+
+
+def _seed_user_to_db_and_cache(user_id: str, raw_token: str, role: str) -> None:
+    """Hash the token with argon2id, persist to DB, and cache in _USER_STORE."""
+    token_hash, alg = hash_token_argon2(raw_token)
+    sha_hash = hash_token(raw_token)
+
+    # Persist to database (upsert by username so restarts don't duplicate rows)
+    try:
+        from services.common.database import get_db
+        from services.common.config import settings
+        db = get_db(settings.db_path)
+        db.upsert_user(
+            username=user_id,
+            display_name=user_id.capitalize(),
+            role=role,
+            token_hash=token_hash,
+            hash_algorithm=alg,
+        )
+        logger.info("Persisted user to DB: user_id=%s algorithm=%s", user_id, alg)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist user %s to DB (%s) — using in-memory store only",
+            user_id, exc,
+        )
+
+    # Cache in _USER_STORE (keyed by sha256 for fast lookup path)
+    _USER_STORE[sha_hash] = {
+        "token_hash": token_hash,
+        "user_id": user_id,
+        "role": role,
+        "hash_algorithm": alg,
+        "_cached_at": time.time(),
+    }
+    logger.info("Seeded user (%s): user_id=%s role=%s", alg, user_id, role)

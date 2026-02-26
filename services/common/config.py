@@ -6,7 +6,13 @@ for local development. Production values set via Cloud Run env vars.
 
 from __future__ import annotations
 
+import logging
+import warnings
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+_config_logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -88,7 +94,45 @@ class Settings(BaseSettings):
     max_pages_per_document: int = 500
     ai_drafting_timeout_seconds: int = 60
 
+    # CORS
+    cors_allowed_origins: str = "http://localhost:3000,http://localhost:3001,https://hitl-dashboard.vercel.app"
+
+    # Security
+    rate_limit_per_minute: int = 60
+    rate_limit_upload_per_minute: int = 10
+    trusted_hosts: str = "*"
+
+    # axesSense (PAC equivalent) validation
+    axessense_url: str = ""
+    axessense_api_key: str = ""
+    axessense_enabled: bool = False
+
     model_config = {"env_prefix": "WCAG_", "env_file": ".env", "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> "Settings":
+        # Hard errors for invalid combinations
+        if self.db_backend == "postgres" and not self.postgres_url:
+            raise ValueError(
+                "db_backend is 'postgres' but postgres_url is empty. "
+                "Set WCAG_POSTGRES_URL or switch to WCAG_DB_BACKEND=sqlite."
+            )
+        if self.db_backend not in ("sqlite", "postgres"):
+            raise ValueError(
+                f"db_backend must be 'sqlite' or 'postgres', got '{self.db_backend}'."
+            )
+        # Soft warnings for missing optional config
+        if not self.adobe_client_id:
+            warnings.warn(
+                "WCAG_ADOBE_CLIENT_ID is empty — Adobe API calls will fail.",
+                stacklevel=2,
+            )
+        if not self.admin_token:
+            warnings.warn(
+                "WCAG_ADMIN_TOKEN is empty — admin auth will be unavailable.",
+                stacklevel=2,
+            )
+        return self
 
 
 settings = Settings()

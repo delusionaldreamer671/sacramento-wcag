@@ -48,3 +48,6 @@ htmlcov/
 
 # Adobe Extract API cache (local only — avoids burning free-tier quota)
 .extract_cache/
+
+# Local Netlify folder
+.netlify

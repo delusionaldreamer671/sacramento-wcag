@@ -108,7 +108,7 @@ export async function fetchDocuments(
     skip: String(skip),
     limit: String(limit),
   });
-  return request<PDFDocument[]>(`/api/documents?${params.toString()}`);
+  return request<PDFDocument[]>(`/api/v1/documents?${params.toString()}`);
 }
 
 /**
@@ -118,7 +118,7 @@ export async function fetchDocument(
   id: string,
 ): Promise<DocumentStatusResponse> {
   if (!id) throw new Error("fetchDocument: id is required");
-  return request<DocumentStatusResponse>(`/api/documents/${encodeURIComponent(id)}`);
+  return request<DocumentStatusResponse>(`/api/v1/documents/${encodeURIComponent(id)}`);
 }
 
 /**
@@ -130,7 +130,7 @@ export async function fetchReviewItems(
 ): Promise<HITLReviewItem[]> {
   if (!documentId) throw new Error("fetchReviewItems: documentId is required");
   return request<HITLReviewItem[]>(
-    `/api/documents/${encodeURIComponent(documentId)}/review-items`,
+    `/api/v1/documents/${encodeURIComponent(documentId)}/review-items`,
   );
 }
 
@@ -145,7 +145,7 @@ export async function submitReview(
   payload: ReviewDecisionPayload,
 ): Promise<void> {
   if (!itemId) throw new Error("submitReview: itemId is required");
-  await request<void>(`/api/review-items/${encodeURIComponent(itemId)}/decision`, {
+  await request<void>(`/api/v1/review-items/${encodeURIComponent(itemId)}/decision`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -158,7 +158,7 @@ export async function batchApprove(request_: BatchApproveRequest): Promise<void>
   if (!request_.item_ids?.length) {
     throw new Error("batchApprove: item_ids must be a non-empty array");
   }
-  await request<void>("/api/review-items/batch-approve", {
+  await request<void>("/api/v1/review-items/batch-approve", {
     method: "POST",
     body: JSON.stringify(request_),
   });
@@ -168,7 +168,7 @@ export async function batchApprove(request_: BatchApproveRequest): Promise<void>
  * Fetch pipeline health status.
  */
 export async function fetchHealth(): Promise<PipelineHealthResponse> {
-  return request<PipelineHealthResponse>("/api/health");
+  return request<PipelineHealthResponse>("/api/v1/health");
 }
 
 /**
@@ -192,7 +192,7 @@ export async function uploadAndConvert(
   const formData = new FormData();
   formData.append("file", file);
 
-  const url = `${BASE_URL}/api/convert?output_format=${encodeURIComponent(outputFormat)}`;
+  const url = `${BASE_URL}/api/v1/convert?output_format=${encodeURIComponent(outputFormat)}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -233,7 +233,7 @@ export interface RemediationReport {
 export async function fetchRemediationReport(
   taskId: string,
 ): Promise<RemediationReport> {
-  return request<RemediationReport>(`/api/${encodeURIComponent(taskId)}/fixes-applied`);
+  return request<RemediationReport>(`/api/v1/${encodeURIComponent(taskId)}/fixes-applied`);
 }
 
 export { APIError };
@@ -314,7 +314,7 @@ export async function analyzeDocument(file: File): Promise<AnalysisResult> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const url = `${BASE_URL}/api/analyze`;
+  const url = `${BASE_URL}/api/v1/analyze`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -350,7 +350,7 @@ export async function remediateDocument(
     formData.append("approved_ids", JSON.stringify(approvedIds));
   }
 
-  const url = `${BASE_URL}/api/remediate?output_format=${encodeURIComponent(outputFormat)}&validation_mode=draft`;
+  const url = `${BASE_URL}/api/v1/remediate?output_format=${encodeURIComponent(outputFormat)}&validation_mode=draft`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -381,7 +381,7 @@ export async function createProposal(data: {
   finding_severity?: string;
   finding_criterion?: string;
 }): Promise<ChangeProposal> {
-  return request<ChangeProposal>("/api/proposals", {
+  return request<ChangeProposal>("/api/v1/proposals", {
     method: "POST",
     body: JSON.stringify(data),
   });
@@ -395,17 +395,17 @@ export async function fetchProposals(
   if (documentId) params.set("document_id", documentId);
   if (status) params.set("status", status);
   const qs = params.toString();
-  return request<ChangeProposal[]>(`/api/proposals${qs ? `?${qs}` : ""}`);
+  return request<ChangeProposal[]>(`/api/v1/proposals${qs ? `?${qs}` : ""}`);
 }
 
 export async function applyProposal(proposalId: string): Promise<ChangeProposal> {
-  return request<ChangeProposal>(`/api/proposals/${encodeURIComponent(proposalId)}/apply`, {
+  return request<ChangeProposal>(`/api/v1/proposals/${encodeURIComponent(proposalId)}/apply`, {
     method: "POST",
   });
 }
 
 export async function rollbackProposal(proposalId: string): Promise<ChangeProposal> {
-  return request<ChangeProposal>(`/api/proposals/${encodeURIComponent(proposalId)}/rollback`, {
+  return request<ChangeProposal>(`/api/v1/proposals/${encodeURIComponent(proposalId)}/rollback`, {
     method: "POST",
   });
 }
@@ -416,7 +416,7 @@ export async function fetchRules(status?: string): Promise<Rule[]> {
   const params = new URLSearchParams();
   if (status) params.set("status", status);
   const qs = params.toString();
-  return request<Rule[]>(`/api/rules${qs ? `?${qs}` : ""}`);
+  return request<Rule[]>(`/api/v1/rules${qs ? `?${qs}` : ""}`);
 }
 
 export async function createRule(data: {
@@ -425,7 +425,7 @@ export async function createRule(data: {
   confidence?: number;
   created_from?: string;
 }): Promise<Rule> {
-  return request<Rule>("/api/rules", {
+  return request<Rule>("/api/v1/rules", {
     method: "POST",
     body: JSON.stringify(data),
   });
@@ -435,7 +435,7 @@ export async function updateRuleStatus(
   ruleId: string,
   status: string,
 ): Promise<Rule> {
-  return request<Rule>(`/api/rules/${encodeURIComponent(ruleId)}/status`, {
+  return request<Rule>(`/api/v1/rules/${encodeURIComponent(ruleId)}/status`, {
     method: "PATCH",
     body: JSON.stringify({ status }),
   });
@@ -448,7 +448,7 @@ export async function fetchAuditTrail(
   entityId: string,
 ): Promise<AuditEntry[]> {
   return request<AuditEntry[]>(
-    `/api/audit/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}`,
+    `/api/v1/audit/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}`,
   );
 }
 
@@ -486,7 +486,7 @@ export interface WCAGRuleRef {
 }
 
 export async function fetchWCAGRules(): Promise<WCAGRuleRef[]> {
-  return request<WCAGRuleRef[]>("/api/wcag-rules");
+  return request<WCAGRuleRef[]>("/api/v1/wcag-rules");
 }
 
 // --- Coverage Matrix API ---
@@ -528,15 +528,15 @@ export interface ContentTypeEntry {
 }
 
 export async function fetchCoverageMatrix(): Promise<CoverageMatrixEntry[]> {
-  return request<CoverageMatrixEntry[]>("/api/wcag/coverage-matrix");
+  return request<CoverageMatrixEntry[]>("/api/v1/wcag/coverage-matrix");
 }
 
 export async function fetchCoverageSummary(): Promise<CoverageSummary> {
-  return request<CoverageSummary>("/api/wcag/coverage-summary");
+  return request<CoverageSummary>("/api/v1/wcag/coverage-summary");
 }
 
 export async function fetchContentTypeMatrix(): Promise<ContentTypeEntry[]> {
-  return request<ContentTypeEntry[]>("/api/wcag/content-type-matrix");
+  return request<ContentTypeEntry[]>("/api/v1/wcag/content-type-matrix");
 }
 
 // --- Alt Text Proposals API ---
@@ -545,7 +545,7 @@ export async function fetchAltTextProposals(
   taskId: string,
 ): Promise<{ task_id: string; proposals: AltTextProposal[]; count: number }> {
   return request<{ task_id: string; proposals: AltTextProposal[]; count: number }>(
-    `/api/documents/${encodeURIComponent(taskId)}/alt-text-proposals`,
+    `/api/v1/documents/${encodeURIComponent(taskId)}/alt-text-proposals`,
   );
 }
 
@@ -556,7 +556,7 @@ export async function submitAltTextDecision(
   reviewedBy?: string,
 ): Promise<AltTextProposal> {
   return request<AltTextProposal>(
-    `/api/alt-text-proposals/${encodeURIComponent(proposalId)}/decision`,
+    `/api/v1/alt-text-proposals/${encodeURIComponent(proposalId)}/decision`,
     {
       method: "POST",
       body: JSON.stringify({
@@ -573,7 +573,7 @@ export async function batchApproveAltText(
   reviewedBy?: string,
 ): Promise<{ approved_count: number }> {
   return request<{ approved_count: number }>(
-    "/api/alt-text-proposals/batch-approve",
+    "/api/v1/alt-text-proposals/batch-approve",
     {
       method: "POST",
       body: JSON.stringify({

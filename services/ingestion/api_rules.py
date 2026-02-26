@@ -11,11 +11,12 @@ from pydantic import BaseModel, Field
 
 from services.common.auth import require_admin, require_reviewer
 from services.common.config import settings
+from services.common.constants import API_V1_PREFIX
 from services.common.database import get_db
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/rules", tags=["rules"])
+router = APIRouter(prefix=f"{API_V1_PREFIX}/rules", tags=["rules"])
 
 
 class RuleCreateRequest(BaseModel):

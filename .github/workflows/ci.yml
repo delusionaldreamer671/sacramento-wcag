@@ -1,0 +1,94 @@
+name: CI/CD — Test & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GCP_PROJECT_ID: report-conciliation-487916
+  GCP_REGION: us-central1
+  SERVICE_NAME: sacto-wcag-api
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python -m pytest tests/ -x -q --tb=short
+        env:
+          PYTHONPATH: .
+
+  deploy:
+    name: Deploy to Cloud Run
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # NOTE: Adobe API credentials must be added as GitHub repository secrets:
+      #   - ADOBE_CLIENT_ID     → maps to WCAG_ADOBE_CLIENT_ID at runtime
+      #   - ADOBE_CLIENT_SECRET → maps to WCAG_ADOBE_CLIENT_SECRET at runtime
+      # These are NOT included as literal values here to prevent secret exposure.
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --source . \
+            --region ${{ env.GCP_REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 2Gi \
+            --cpu 2 \
+            --timeout 300 \
+            --concurrency 1 \
+            --min-instances 0 \
+            --max-instances 4 \
+            --set-env-vars "\
+              WCAG_GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},\
+              WCAG_GCP_REGION=${{ env.GCP_REGION }},\
+              WCAG_VERTEX_AI_MODEL=gemini-2.5-pro,\
+              WCAG_VERTEX_AI_LOCATION=${{ env.GCP_REGION }},\
+              PYTHONPATH=/app,\
+              WCAG_DB_PATH=/data/wcag_pipeline.db,\
+              WCAG_EXTRACTION_CACHE_DIR=/data/.extract_cache,\
+              WCAG_ADOBE_CLIENT_ID=${{ secrets.ADOBE_CLIENT_ID }},\
+              WCAG_ADOBE_CLIENT_SECRET=${{ secrets.ADOBE_CLIENT_SECRET }}"
+
+      - name: Verify deployment health
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} --format 'value(status.url)')
+          echo "Service URL: $SERVICE_URL"
+          curl -sf "$SERVICE_URL/api/health" | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['status'] == 'healthy', f'Health check failed: {data}'
+          print('Health check passed')
+          "

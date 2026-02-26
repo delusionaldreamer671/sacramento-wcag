@@ -380,3 +380,83 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ADOBE_CLIENT_ID=<your-client-id>
 ADOBE_CLIENT_SECRET=<your-client-secret>
 ```
+
+---
+
+## Deployment Checklist
+
+**CRITICAL: Follow this checklist for EVERY deployment. Skipping steps has caused production outages.**
+
+### Backend (Cloud Run)
+
+**Required env vars** — these MUST be present on every Cloud Run revision:
+```
+WCAG_ADOBE_CLIENT_ID=<adobe-client-id>
+WCAG_ADOBE_CLIENT_SECRET=<adobe-client-secret>
+WCAG_GCP_PROJECT_ID=report-conciliation-487916
+WCAG_GCP_REGION=us-central1
+WCAG_VERTEX_AI_MODEL=gemini-2.5-pro
+WCAG_VERTEX_AI_LOCATION=us-central1
+PYTHONPATH=/app
+WCAG_DB_PATH=/data/wcag_pipeline.db
+WCAG_EXTRACTION_CACHE_DIR=/data/.extract_cache
+PYTHONUNBUFFERED=1
+```
+
+**Deploy command** — ALWAYS use `--update-env-vars` (merges), NEVER `--set-env-vars` (replaces all):
+```bash
+# CORRECT — preserves existing env vars:
+gcloud run deploy sacto-wcag-api \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 2Gi \
+  --timeout 300 \
+  --update-env-vars="PYTHONUNBUFFERED=1"
+
+# WRONG — wipes all other env vars:
+# gcloud run deploy ... --set-env-vars="PYTHONUNBUFFERED=1"
+```
+
+**Post-deploy verification** (run ALL three):
+```bash
+# 1. Verify env vars survived
+gcloud run revisions describe <REVISION> --region us-central1 \
+  --format='yaml(spec.containers[0].env[].name)'
+# Must show all 10 env vars listed above
+
+# 2. Health check
+curl https://sacto-wcag-api-738802459862.us-central1.run.app/api/health
+
+# 3. Smoke test — analyze a small PDF and check for 50-rule audit
+# Response must include rules_checked=50 in summary
+```
+
+### Frontend (Vercel)
+
+**Required env var** (set in Vercel project settings):
+```
+NEXT_PUBLIC_API_URL=https://sacto-wcag-api-738802459862.us-central1.run.app
+```
+
+**Deploy command**:
+```bash
+cd hitl-dashboard
+npx vercel --prod --force  # --force bypasses build cache
+```
+
+**Post-deploy verification**:
+```bash
+# Check production alias is updated
+npx vercel ls --prod
+# Visit https://hitl-dashboard.vercel.app/upload and verify UI loads
+```
+
+### Common Pitfalls (learned from incidents)
+
+| Pitfall | Impact | Prevention |
+|---------|--------|------------|
+| `--set-env-vars` instead of `--update-env-vars` | Wipes all credentials → 500 on every API call | Always use `--update-env-vars` for incremental changes |
+| Vercel build cache serves old code | UI shows stale components | Use `--force` flag on deploy |
+| Missing `PYTHONPATH=/app` | Module imports fail in container | Include in env vars; verify after deploy |
+| `PYTHONPATH` set to local Windows path | Imports break in Linux container | Must be `/app`, not `C:/Program Files/...` |

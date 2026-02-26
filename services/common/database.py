@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS review_items (
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'reviewer',
-    token_hash TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+    token_hash TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+    hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+    token_expires_at TEXT);
 CREATE TABLE IF NOT EXISTS change_proposals (
     id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id),
     review_item_id TEXT, proposed_by TEXT NOT NULL, human_comment TEXT NOT NULL,
@@ -356,13 +358,39 @@ class Database:
     # ------------------------------------------------------------------
 
     def create_user(self, username: str, display_name: str,
-                    role: str, token_hash: str) -> str:
+                    role: str, token_hash: str,
+                    hash_algorithm: str = "sha256",
+                    token_expires_at: str | None = None) -> str:
         uid = _new_id()
         self._run(
-            "INSERT INTO users (id,username,display_name,role,token_hash,created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (uid, username, display_name, role, token_hash, _now()),
+            "INSERT INTO users"
+            " (id,username,display_name,role,token_hash,created_at,hash_algorithm,token_expires_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (uid, username, display_name, role, token_hash, _now(), hash_algorithm, token_expires_at),
         )
+        return uid
+
+    def upsert_user(self, username: str, display_name: str,
+                    role: str, token_hash: str,
+                    hash_algorithm: str = "sha256",
+                    token_expires_at: str | None = None) -> str:
+        """Insert or replace a user record keyed by username."""
+        existing = self._one("SELECT id FROM users WHERE username=?", (username,))
+        if existing:
+            uid = existing["id"]
+            self._run(
+                "UPDATE users SET display_name=?,role=?,token_hash=?,hash_algorithm=?,"
+                "token_expires_at=?,active=1 WHERE id=?",
+                (display_name, role, token_hash, hash_algorithm, token_expires_at, uid),
+            )
+        else:
+            uid = _new_id()
+            self._run(
+                "INSERT INTO users"
+                " (id,username,display_name,role,token_hash,created_at,hash_algorithm,token_expires_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (uid, username, display_name, role, token_hash, _now(), hash_algorithm, token_expires_at),
+            )
         return uid
 
     def get_user_by_token(self, token_hash: str) -> dict | None:
