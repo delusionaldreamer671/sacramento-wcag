@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -51,9 +52,13 @@ from services.common.ir import (
     IRDocument,
     IRPage,
     RemediationStatus,
+    ValidationMode,
+    dedupe_tables_in_page,
 )
+from services.common.database import get_db
 from services.common.gates import run_gate_g3
 from services.common.telemetry import get_tracer
+from services.common.telemetry_collector import TelemetryCollector
 from services.common.verapdf_client import VeraPDFClient, VeraPDFResult
 from services.recompilation.pdfua_builder import PDFUABuilder
 
@@ -110,15 +115,27 @@ def stage_extract(pdf_bytes: bytes, filename: str) -> IRDocument:
 
             elements = _reconstruct_document(extract_json, pdf_path=local_pdf)
             span.set_attribute("reconstruction.output_elements", len(elements))
+
+            # Phase 5B: Extract form fields from the PDF via pikepdf
+            # (Adobe Extract JSON doesn't enumerate AcroForm widget annotations)
+            form_fields = _extract_form_fields(local_pdf)
+            if form_fields:
+                elements.extend(form_fields)
+                span.set_attribute("extraction.form_fields", len(form_fields))
         finally:
             _tmp.cleanup()
 
         ir_doc = _elements_to_ir(elements, extract_json, document_id, filename)
         span.set_attribute("ir.pages", ir_doc.page_count)
         span.set_attribute("ir.blocks", len(ir_doc.all_blocks()))
+
+        # Persist image bytes to SQLite for HITL preview (non-blocking)
+        images_stored = _persist_image_assets(ir_doc)
+        span.set_attribute("ir.images_stored", images_stored)
         logger.info(
-            "stage_extract: %d raw → %d elements → IR(%d pages, %d blocks)",
+            "stage_extract: %d raw → %d elements → IR(%d pages, %d blocks) — %d images persisted",
             raw_count, len(elements), ir_doc.page_count, len(ir_doc.all_blocks()),
+            images_stored,
         )
         return ir_doc
 
@@ -130,8 +147,6 @@ def stage_extract(pdf_bytes: bytes, filename: str) -> IRDocument:
 _GENERIC_ALT_PATTERN = re.compile(
     r"^\[Figure on page .+ — alt text requires review\]$"
 )
-
-_AI_ALT_TEXT_IMAGE_LIMIT = 20  # Process at most this many images per document
 
 
 def _vertex_ai_available() -> bool:
@@ -225,8 +240,9 @@ def stage_ai_alt_text(
     - The image block has no ``src`` (image bytes were not available)
     - The alt text is already non-generic (Adobe provided real alt text)
 
-    Rate limit: only the first ``_AI_ALT_TEXT_IMAGE_LIMIT`` eligible images per
-    document are processed. Beyond that limit, blocks keep their generic placeholder.
+    All eligible images are processed. Images are sent to Gemini in batches of 5
+    with a 2-second delay between batches to avoid Gemini 429 rate limit errors.
+    Progress is logged every 10 images processed.
 
     Args:
         ir_doc: The IRDocument produced by ``stage_extract``.
@@ -252,117 +268,149 @@ def stage_ai_alt_text(
         return ir_doc
 
     all_blocks = ir_doc.all_blocks()
+    images_total = sum(1 for b in all_blocks if b.block_type == BlockType.IMAGE)
     processed = 0
+    ai_succeeded = 0
+    ai_failed = 0
     skipped_no_src = 0
     skipped_has_alt = 0
-    skipped_limit = 0
+
+    # Collect eligible (block, idx) pairs first so we can batch with rate limiting
+    eligible: list[tuple[int, IRBlock]] = []
+    for idx, block in enumerate(all_blocks):
+        if block.block_type != BlockType.IMAGE:
+            continue
+
+        attrs = block.attributes
+        alt = attrs.get("alt", "")
+        src = attrs.get("src", "")
+
+        # Skip if Adobe already provided real alt text (not a generic placeholder)
+        if alt and not _GENERIC_ALT_PATTERN.match(alt):
+            skipped_has_alt += 1
+            continue
+
+        # W3C alt-text decision tree classification
+        img_class = _classify_image_w3c(block, all_blocks, idx)
+
+        if img_class == "decorative":
+            # Decorative: set empty alt, mark as aria-hidden, skip AI call
+            block.attributes["alt"] = ""
+            block.attributes["aria-hidden"] = "true"
+            block.remediation_status = RemediationStatus.AI_DRAFTED
+            logger.debug(
+                "stage_ai_alt_text: block %d classified as decorative — skipping AI",
+                idx,
+            )
+            continue
+
+        if img_class == "complex":
+            # Flag for HITL dashboard to pick up
+            block.attributes["data-complexity"] = "complex"
+
+        # Skip if no image data was extracted (no src → can't send image to Gemini)
+        if not src or not src.startswith("data:"):
+            skipped_no_src += 1
+            continue
+
+        eligible.append((idx, block))
+
+    total_eligible = len(eligible)
 
     with tracer.start_as_current_span("stage.ai_alt_text") as span:
-        for idx, block in enumerate(all_blocks):
-            if block.block_type != BlockType.IMAGE:
-                continue
+        _BATCH_SIZE = 5
+        for batch_start in range(0, total_eligible, _BATCH_SIZE):
+            batch = eligible[batch_start:batch_start + _BATCH_SIZE]
 
-            attrs = block.attributes
-            alt = attrs.get("alt", "")
-            src = attrs.get("src", "")
+            # Rate limiting: pause between batches (not before the first batch)
+            if batch_start > 0:
+                time.sleep(2.0)
 
-            # Skip if Adobe already provided real alt text (not a generic placeholder)
-            if alt and not _GENERIC_ALT_PATTERN.match(alt):
-                skipped_has_alt += 1
-                continue
+            for idx, block in batch:
+                attrs = block.attributes
+                alt = attrs.get("alt", "")
+                src = attrs.get("src", "")
 
-            # W3C alt-text decision tree classification
-            img_class = _classify_image_w3c(block, all_blocks, idx)
+                # Extract base64 payload and MIME type from the data URI.
+                # Format: "data:<mime>;base64,<b64data>"
+                try:
+                    header, b64_payload = src.split(",", 1)
+                    mime = header.split(":")[1].split(";")[0]
+                except (ValueError, IndexError):
+                    logger.debug(
+                        "stage_ai_alt_text: malformed data URI on block index %d — skipping",
+                        idx,
+                    )
+                    skipped_no_src += 1
+                    continue
 
-            if img_class == "decorative":
-                # Decorative: set empty alt, mark as aria-hidden, skip AI call
-                block.attributes["alt"] = ""
-                block.attributes["aria-hidden"] = "true"
-                block.remediation_status = RemediationStatus.AI_DRAFTED
-                logger.debug(
-                    "stage_ai_alt_text: block %d classified as decorative — skipping AI",
-                    idx,
+                img_class = block.attributes.get("data-complexity", "informative")
+
+                # Gather surrounding text context from adjacent non-image blocks
+                surrounding = _get_surrounding_text(all_blocks, idx, window=3)
+
+                # Call Vertex AI — falls back to fallback_alt on any error
+                new_alt = generate_alt_text_for_image(
+                    image_base64=b64_payload,
+                    image_mime=mime,
+                    surrounding_text=surrounding,
+                    page_num=block.page_num + 1,  # Convert 0-based IR to 1-based for prompt
+                    fallback_alt=alt,
                 )
-                continue
 
-            if img_class == "complex":
-                # Flag for HITL dashboard to pick up
-                block.attributes["data-complexity"] = "complex"
+                # For complex images, append a review note to the AI-generated alt text
+                if img_class == "complex" and new_alt and new_alt != alt:
+                    new_alt = new_alt.rstrip(".") + ". (Complex image — requires human review)"
 
-            # Skip if no image data was extracted (no src → can't send image to Gemini)
-            if not src or not src.startswith("data:"):
-                skipped_no_src += 1
-                continue
+                # Update the block's alt text and remediation status
+                block.attributes["alt"] = new_alt
+                if new_alt != alt:
+                    block.remediation_status = RemediationStatus.AI_DRAFTED
+                    ai_succeeded += 1
+                    if collector:
+                        collector.record(
+                            RemediationComponent.ALT_TEXT,
+                            element_id=block.block_id,
+                            before=alt if alt else None,
+                            after=new_alt,
+                            source="ai",
+                        )
+                else:
+                    # Gemini returned the fallback (unchanged) — likely an error or timeout
+                    ai_failed += 1
+                    block.attributes["data-needs-review"] = "alt-text"
 
-            # Enforce per-document image limit
-            if processed >= _AI_ALT_TEXT_IMAGE_LIMIT:
-                skipped_limit += 1
-                continue
+                processed += 1
 
-            # Extract base64 payload and MIME type from the data URI.
-            # Format: "data:<mime>;base64,<b64data>"
-            try:
-                header, b64_payload = src.split(",", 1)
-                mime = header.split(":")[1].split(";")[0]
-            except (ValueError, IndexError):
-                logger.debug(
-                    "stage_ai_alt_text: malformed data URI on block index %d — skipping",
-                    idx,
-                )
-                skipped_no_src += 1
-                continue
-
-            # Gather surrounding text context from adjacent non-image blocks
-            surrounding = _get_surrounding_text(all_blocks, idx, window=3)
-
-            # Call Vertex AI — falls back to fallback_alt on any error
-            new_alt = generate_alt_text_for_image(
-                image_base64=b64_payload,
-                image_mime=mime,
-                surrounding_text=surrounding,
-                page_num=block.page_num + 1,  # Convert 0-based IR to 1-based for prompt
-                fallback_alt=alt,
-            )
-
-            # For complex images, append a review note to the AI-generated alt text
-            if img_class == "complex" and new_alt and new_alt != alt:
-                new_alt = new_alt.rstrip(".") + ". (Complex image — requires human review)"
-
-            # Update the block's alt text and remediation status
-            block.attributes["alt"] = new_alt
-            if new_alt != alt:
-                block.remediation_status = RemediationStatus.AI_DRAFTED
-                if collector:
-                    collector.record(
-                        RemediationComponent.ALT_TEXT,
-                        element_id=block.block_id,
-                        before=alt if alt else None,
-                        after=new_alt,
-                        source="ai",
+                # Progress logging every 10 images
+                if processed % 10 == 0:
+                    logger.info(
+                        "AI alt text progress: %d/%d processed",
+                        processed,
+                        total_eligible,
                     )
 
-            processed += 1
-
-        span.set_attribute("ai_alt_text.processed", processed)
+        span.set_attribute("ai_alt_text.images_total", images_total)
+        span.set_attribute("ai_alt_text.ai_attempted", processed)
+        span.set_attribute("ai_alt_text.ai_succeeded", ai_succeeded)
+        span.set_attribute("ai_alt_text.ai_failed", ai_failed)
         span.set_attribute("ai_alt_text.skipped_no_src", skipped_no_src)
         span.set_attribute("ai_alt_text.skipped_has_alt", skipped_has_alt)
-        span.set_attribute("ai_alt_text.skipped_limit", skipped_limit)
 
-        if skipped_limit > 0:
-            logger.warning(
-                "stage_ai_alt_text: document has more than %d images eligible for AI alt text; "
-                "%d images left with placeholder alt text",
-                _AI_ALT_TEXT_IMAGE_LIMIT,
-                skipped_limit,
-            )
+        placeholder_remaining = images_total - skipped_has_alt - ai_succeeded
 
+        # Structured telemetry summary (visible in Cloud Run logs)
         logger.info(
-            "stage_ai_alt_text: processed=%d skipped_no_src=%d "
-            "skipped_has_alt=%d skipped_limit=%d",
+            "stage_ai_alt_text SUMMARY: images_total=%d ai_attempted=%d "
+            "ai_succeeded=%d ai_failed=%d skipped_no_src=%d "
+            "skipped_has_alt=%d placeholder_remaining=%d",
+            images_total,
             processed,
+            ai_succeeded,
+            ai_failed,
             skipped_no_src,
             skipped_has_alt,
-            skipped_limit,
+            placeholder_remaining,
         )
 
     return ir_doc
@@ -413,6 +461,73 @@ def _get_surrounding_text(
     return " ".join(text_parts)
 
 
+# ---------------------------------------------------------------------------
+# Image asset persistence helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_data_uri(data_uri: str) -> tuple[bytes, str] | None:
+    """Parse a data URI into (raw_bytes, mime_type). Returns None on failure."""
+    m = re.match(r"data:([^;]+);base64,(.+)", data_uri, re.DOTALL)
+    if not m:
+        return None
+    mime = m.group(1)
+    try:
+        raw = base64.b64decode(m.group(2))
+        return raw, mime
+    except Exception:
+        return None
+
+
+def _persist_image_assets(ir_doc: IRDocument) -> int:
+    """Store image bytes from IR blocks to SQLite for HITL preview.
+
+    Iterates all IMAGE blocks in the IRDocument. For each block with a
+    ``data:`` URI src, extracts raw bytes, generates a deterministic
+    ``image_id`` = ``img_p{page_num}_i{figure_idx}`` (counter per page),
+    stores to SQLite via ``insert_image_asset``, and sets
+    ``block.attributes["image_id"]`` so the IR carries the reference forward.
+
+    Returns:
+        Number of image assets successfully stored.
+    """
+    db = get_db(settings.db_path)
+    stored = 0
+    page_figure_counters: dict[int, int] = {}
+
+    for block in ir_doc.all_blocks():
+        if block.block_type != BlockType.IMAGE:
+            continue
+        src = block.attributes.get("src", "")
+        if not src.startswith("data:"):
+            continue
+        parsed = _parse_data_uri(src)
+        if parsed is None:
+            continue
+        raw_bytes, mime = parsed
+
+        page_num = block.page_num
+        idx = page_figure_counters.get(page_num, 0)
+        page_figure_counters[page_num] = idx + 1
+
+        image_id = f"img_p{page_num}_i{idx}"
+        block.attributes["image_id"] = image_id
+
+        try:
+            db.insert_image_asset(
+                image_id=image_id,
+                document_id=ir_doc.document_id,
+                page_num=page_num,
+                mime_type=mime,
+                image_data=raw_bytes,
+            )
+            stored += 1
+        except Exception:
+            logger.warning("Failed to persist image %s", image_id, exc_info=True)
+
+    return stored
+
+
 def stage_build_html(
     ir_doc: IRDocument,
     title: str,
@@ -436,7 +551,9 @@ def stage_build_html(
 
 
 def stage_validate(
-    builder: PDFUABuilder, html_content: str
+    builder: PDFUABuilder,
+    html_content: str,
+    mode: ValidationMode = ValidationMode.PUBLISH,
 ) -> dict[str, Any]:
     """Stage 4: Accessibility validation with critical-violation blocking.
 
@@ -455,9 +572,15 @@ def stage_validate(
         - Any ``<table>`` without ``<th scope>`` headers (WCAG 1.3.1)
       WARNING (annotation only, never blocks):
         - Heading hierarchy skips (WCAG 2.4.6)
+
+    Args:
+        builder: PDFUABuilder instance used to validate the HTML.
+        html_content: Semantic HTML string to validate.
+        mode: ValidationMode passed through to ``validate_accessibility()``.
+              DRAFT mode relaxes blocking thresholds.
     """
     with tracer.start_as_current_span("stage.validation") as span:
-        validation = builder.validate_accessibility(html_content)
+        validation = builder.validate_accessibility(html_content, mode=mode)
         score = validation.get("score", 0)
         violations = validation.get("violations", [])
         blocked = validation.get("blocked", False)
@@ -539,25 +662,38 @@ def _generate_tagged_pdf(
     span: Any,
     collector: RemediationEventCollector | None = None,
 ) -> bytes:
-    """Generate a tagged PDF/UA document, preferring Auto-Tag over reportlab.
+    """Generate a tagged PDF/UA document.
 
-    Strategy:
-      1. Try Adobe Auto-Tag → pikepdf enhance (preserves original layout)
-      2. Fall back to reportlab rendering (re-rendered layout)
-
-    The Auto-Tag path requires ``pdf_bytes`` (source PDF) and ``ir_doc``
-    (for alt text injection and bookmark generation).
+    Strategy (ordered by fidelity):
+      1. Try Adobe Auto-Tag → pikepdf enhance (preserves original layout + tags)
+      2. Fail with a clear error — Playwright/Chromium print-to-PDF does NOT
+         produce tagged PDFs (no /StructTreeRoot, no heading tags, no alt text
+         in the PDF structure). Shipping an untagged PDF as "remediated" would
+         be worse than the original.
     """
-    # Attempt Auto-Tag path when source PDF bytes are available
+    # Strategy 1: Auto-Tag path when source PDF bytes are available
     if pdf_bytes and ir_doc:
         tagged = _try_auto_tag_path(pdf_bytes, ir_doc, span, collector=collector)
         if tagged:
             return tagged
 
-    # Fallback: reportlab rendering
-    span.set_attribute("output.pdf_method", "reportlab_fallback")
-    logger.info("_generate_tagged_pdf: using reportlab fallback")
-    return builder.generate_pdfua(html_content)
+    # Auto-Tag unavailable — fail with a clear explanation.
+    # Playwright/Chromium print-to-PDF does NOT produce tagged PDFs.
+    # The output would have zero accessibility structure, making it worse
+    # than the original. We must not ship an untagged PDF as "remediated".
+    span.set_attribute("output.pdf_method", "blocked_no_auto_tag")
+    logger.error(
+        "_generate_tagged_pdf: Adobe Auto-Tag unavailable. Cannot produce "
+        "accessible PDF output without it. Playwright/Chromium print-to-PDF "
+        "does NOT generate tagged PDFs (no /StructTreeRoot, no /Figure tags, "
+        "no /Alt attributes). Returning HTML output is still available."
+    )
+    raise RuntimeError(
+        "PDF output requires Adobe Auto-Tag for accessibility compliance. "
+        "Auto-Tag is currently unavailable (check Adobe credentials). "
+        "The pipeline can still produce accessible HTML output — "
+        "select HTML format instead, or configure Adobe API credentials."
+    )
 
 
 def _try_auto_tag_path(
@@ -641,6 +777,7 @@ def _try_auto_tag_path(
         return None
 
 
+
 # ---------------------------------------------------------------------------
 # VeraPDF baseline/endline helpers
 # ---------------------------------------------------------------------------
@@ -695,6 +832,38 @@ def _run_verapdf_endline(
 
 
 # ---------------------------------------------------------------------------
+# Selective proposal filtering
+# ---------------------------------------------------------------------------
+
+
+def _filter_unapproved_proposals(ir_doc: IRDocument, approved_ids: set[str]) -> None:
+    """Revert AI-drafted changes for proposals not in approved_ids.
+
+    For images whose proposal was not approved, reverts alt text to a
+    placeholder. This ensures the HITL review decision is respected.
+    """
+    reverted = 0
+    for block in ir_doc.all_blocks():
+        if block.block_type == BlockType.IMAGE:
+            image_id = block.attributes.get("image_id", "")
+            if not image_id:
+                continue
+            # The proposal ID for images IS the image_id
+            if image_id not in approved_ids:
+                # Revert to placeholder
+                page = block.page_num
+                block.attributes["alt"] = (
+                    f"[Figure on page {page + 1} — alt text requires review]"
+                )
+                block.attributes["data-needs-review"] = "true"
+                reverted += 1
+    if reverted:
+        logger.info(
+            "Selective filtering: reverted %d unapproved image alt texts", reverted
+        )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator (public API — unchanged signature)
 # ---------------------------------------------------------------------------
 
@@ -703,11 +872,25 @@ def convert_pdf_sync(
     pdf_bytes: bytes,
     filename: str,
     output_format: OutputFormat = "html",
-) -> tuple[bytes, str]:
+    *,
+    validation_mode: ValidationMode = ValidationMode.PUBLISH,
+    approved_ids: set[str] | None = None,
+) -> tuple[bytes, str, str]:
     """Run the full remediation pipeline synchronously.
 
-    This is the public API. Signature and return type are unchanged from
-    the pre-IR version. Internally it now delegates to staged functions.
+    Returns (output_bytes, content_type, task_id) where task_id can be
+    used to retrieve the remediation audit trail via the fixes-applied API.
+
+    When *validation_mode* is ``ValidationMode.DRAFT`` (used by /api/remediate
+    after user approval), validation issues are logged as warnings but never
+    raise ``ValidationBlockedError``.  The user has already reviewed the
+    analysis and approved remediation — blocking at this stage prevents the
+    document from reaching the HITL review step.
+
+    When *approved_ids* is provided (non-None), only remediations whose
+    proposal ID is in the set are kept. Unapproved image alt text is reverted
+    to a placeholder. When ``None``, all remediations are applied (backward
+    compatible).
     """
     stem = Path(filename).stem
 
@@ -722,98 +905,258 @@ def convert_pdf_sync(
         task_id = str(uuid.uuid4())
         collector = RemediationEventCollector(document_id="", task_id=task_id)
 
-        # Stage 1+2: Extract → IR
-        ir_doc = stage_extract(pdf_bytes, filename)
-        root_span.set_attribute("document.id", ir_doc.document_id)
-        collector.document_id = ir_doc.document_id
+        # Telemetry collector — initialized with placeholder document_id
+        # (real ID is set after extraction).  Safe: failures never disrupt pipeline.
+        tc = TelemetryCollector(
+            document_id="",
+            task_id=task_id,
+            filename=filename,
+            file_size_bytes=len(pdf_bytes),
+        )
+        tc.set("output_format", output_format)
 
-        # VeraPDF baseline (before remediation)
-        baseline_verapdf = _run_verapdf_baseline(pdf_bytes)
+        _current_stage = "extract"  # Track for error reporting
 
-        # Stage 2b: AI alt text (if Vertex AI is configured)
-        ir_doc = stage_ai_alt_text(ir_doc, collector=collector)
+        try:
+            # Stage 1+2: Extract → IR
+            tc.start_stage("extract")
+            ir_doc = stage_extract(pdf_bytes, filename)
+            tc.end_stage()
 
-        # Stage 3: IR → HTML
-        title = f"{stem} — WCAG Remediated"
-        html_content, builder = stage_build_html(ir_doc, title, collector=collector)
+            root_span.set_attribute("document.id", ir_doc.document_id)
+            collector.document_id = ir_doc.document_id
+            tc.set("document_id", ir_doc.document_id)
+            tc.set("page_count", ir_doc.page_count)
 
-        # Stage 4a: G3 gate — structural HTML validation (blocks on P0 failures)
-        g3_result = run_gate_g3(html_content)
-        if not g3_result.passed:
-            p0_failures = [
-                c for c in g3_result.checks
-                if c.status == "hard_fail" and c.priority == "P0"
+            # Collect extraction metrics from IR
+            all_blocks = ir_doc.all_blocks()
+            tc.set("blocks_extracted", len(all_blocks))
+            tc.set("images_found", sum(
+                1 for b in all_blocks if b.block_type == BlockType.IMAGE
+            ))
+            tc.set("tables_found", sum(
+                1 for b in all_blocks if b.block_type == BlockType.TABLE
+            ))
+            tc.set("headings_found", sum(
+                1 for b in all_blocks if b.block_type == BlockType.HEADING
+            ))
+
+            # Deduplicate tables per page (Adobe Extract sometimes returns duplicates)
+            pre_dedup = len(all_blocks)
+            for page in ir_doc.pages:
+                page.blocks = dedupe_tables_in_page(page.blocks)
+
+            # Remove running header/footer artifacts that Adobe didn't tag
+            ir_doc = drop_running_artifacts(ir_doc)
+            post_filter = len(ir_doc.all_blocks())
+            tc.set("artifacts_filtered", pre_dedup - post_filter)
+
+            # VeraPDF baseline (before remediation)
+            baseline_verapdf = _run_verapdf_baseline(pdf_bytes)
+
+            # Persist baseline to database for API access
+            if baseline_verapdf is not None:
+                try:
+                    from services.common.database import get_db
+                    get_db().insert_baseline_validation(
+                        task_id=task_id,
+                        document_id=ir_doc.document_id,
+                        pdf_size_bytes=len(pdf_bytes),
+                        is_compliant=baseline_verapdf.is_compliant,
+                        total_rules_checked=baseline_verapdf.total_rules_checked,
+                        passed_rules=baseline_verapdf.passed_rules,
+                        error_count=baseline_verapdf.error_count,
+                        failed_clauses=baseline_verapdf.failed_clauses,
+                        failed_rules=[
+                            r.model_dump() for r in baseline_verapdf.failed_rules
+                        ],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist baseline validation for task %s",
+                        task_id, exc_info=True,
+                    )
+
+            # Stage 2b: AI alt text (if Vertex AI is configured)
+            _current_stage = "ai"
+            tc.start_stage("ai")
+            ir_doc = stage_ai_alt_text(ir_doc, collector=collector)
+            tc.end_stage()
+
+            # Collect AI metrics from the collector's events
+            tc.set("ai_model", settings.vertex_ai_model or "")
+            ai_events = [
+                e for e in collector.events()
+                if e.component == RemediationComponent.ALT_TEXT
             ]
-            if p0_failures:
-                failure_details = "; ".join(c.details for c in p0_failures)
-                logger.error(
-                    "G3 gate BLOCKED output: %d P0 failures — %s",
-                    len(p0_failures), failure_details,
-                )
-                raise ValidationBlockedError(
-                    f"Output blocked by G3 validation: {failure_details}",
-                    violations=[c.model_dump() for c in p0_failures],
-                )
-            # Non-P0 failures are logged but don't block
-            p1_failures = [c for c in g3_result.checks if c.status != "pass"]
-            if p1_failures:
-                logger.warning(
-                    "G3 gate: %d non-blocking issues found",
-                    len(p1_failures),
-                )
+            ai_succeeded = sum(1 for e in ai_events if e.after)
+            tc.set("ai_alt_text_attempted", len(ai_events))
+            tc.set("ai_alt_text_succeeded", ai_succeeded)
+            tc.set("ai_alt_text_failed", len(ai_events) - ai_succeeded)
 
-        # Stage 4b: Built-in validate_accessibility (scoring + banner)
-        validation = stage_validate(builder, html_content)
-        score = validation.get("score", 0)
+            # --- Selective proposal filtering ---
+            if approved_ids is not None:
+                _filter_unapproved_proposals(ir_doc, approved_ids)
 
-        # Enforce blocking from validate_accessibility too
-        if validation.get("blocked"):
-            critical = validation.get("critical_violations", [])
-            serious = validation.get("serious_violations", [])
-            all_labels = critical + serious
-            logger.error(
-                "Validation BLOCKED delivery: score=%.2f critical=%s serious=%s",
-                score, critical, serious,
+            # Stage 3: IR → HTML
+            _current_stage = "build_html"
+            tc.start_stage("build_html")
+            title = f"{stem} — WCAG Remediated"
+            html_content, builder = stage_build_html(ir_doc, title, collector=collector)
+            tc.end_stage()
+
+            # Stage 4a: G3 gate — structural HTML validation (blocks on P0 failures)
+            _current_stage = "validate"
+            tc.start_stage("validate")
+            g3_result = run_gate_g3(html_content, mode=validation_mode)
+            tc.set("gate_g3_passed", 1 if g3_result.passed else 0)
+            if not g3_result.passed:
+                p0_failures = [
+                    c for c in g3_result.checks
+                    if c.status == "hard_fail" and c.priority == "P0"
+                ]
+                if p0_failures and validation_mode == ValidationMode.PUBLISH:
+                    failure_details = "; ".join(c.details for c in p0_failures)
+                    logger.error(
+                        "G3 gate BLOCKED output: %d P0 failures — %s",
+                        len(p0_failures), failure_details,
+                    )
+                    raise ValidationBlockedError(
+                        f"Output blocked by G3 validation: {failure_details}",
+                        violations=[c.model_dump() for c in p0_failures],
+                    )
+                elif p0_failures:
+                    failure_details = "; ".join(c.details for c in p0_failures)
+                    logger.warning(
+                        "G3 gate: %d P0 failures (non-blocking — user approved): %s",
+                        len(p0_failures), failure_details,
+                    )
+                # Non-P0 failures are logged but don't block
+                p1_failures = [c for c in g3_result.checks if c.status != "pass"]
+                if p1_failures:
+                    logger.warning(
+                        "G3 gate: %d non-blocking issues found",
+                        len(p1_failures),
+                    )
+
+            # Stage 4b: Built-in validate_accessibility (scoring + banner)
+            validation = stage_validate(builder, html_content, mode=validation_mode)
+            score = validation.get("score", 0)
+            tc.set("axe_score", score)
+            tc.set("axe_violations_critical", len(validation.get("critical_violations", [])))
+            tc.set("axe_violations_serious", len(validation.get("serious_violations", [])))
+            tc.set("validation_blocked", 1 if validation.get("blocked") else 0)
+            tc.end_stage()
+
+            # Enforce blocking from validate_accessibility too
+            if validation.get("blocked"):
+                critical = validation.get("critical_violations", [])
+                serious = validation.get("serious_violations", [])
+                all_labels = critical + serious
+                if validation_mode == ValidationMode.PUBLISH:
+                    logger.error(
+                        "Validation BLOCKED delivery: score=%.2f critical=%s serious=%s",
+                        score, critical, serious,
+                    )
+                    raise ValidationBlockedError(
+                        f"Output blocked by validation (score={score:.0%}): "
+                        + "; ".join(all_labels),
+                        violations=validation.get("violations", []),
+                    )
+                else:
+                    logger.warning(
+                        "Validation issues (non-blocking — user approved): "
+                        "score=%.2f critical=%s serious=%s",
+                        score, critical, serious,
+                    )
+
+            # Stage 4c: VeraPDF endline placeholder (populated after stage_output for PDF)
+            endline_verapdf: VeraPDFResult | None = None
+
+            # Stage 4d: Inject validation summary into HTML
+            html_content = _inject_validation_summary(
+                html_content, validation,
+                baseline_verapdf=baseline_verapdf,
+                endline_verapdf=endline_verapdf,
             )
-            raise ValidationBlockedError(
-                f"Output blocked by validation (score={score:.0%}): "
-                + "; ".join(all_labels),
-                violations=validation.get("violations", []),
+
+            # Stage 5: Output
+            _current_stage = "output"
+            tc.start_stage("output")
+            output_bytes, content_type = stage_output(
+                html_content, output_format, builder,
+                pdf_bytes=pdf_bytes, ir_doc=ir_doc, collector=collector,
+            )
+            tc.end_stage()
+            tc.set("output_size_bytes", len(output_bytes))
+
+            # VeraPDF endline (after remediation, PDF only)
+            if output_format == "pdf":
+                endline_verapdf = _run_verapdf_endline(output_bytes, baseline_verapdf)
+
+            # Regression gate: if output has MORE errors than input, warn loudly
+            if endline_verapdf and baseline_verapdf:
+                baseline_errors = baseline_verapdf.error_count
+                endline_errors = endline_verapdf.error_count
+                if endline_errors > baseline_errors:
+                    regression_delta = endline_errors - baseline_errors
+                    regression_msg = (
+                        f"REGRESSION DETECTED: output PDF has {endline_errors} VeraPDF errors "
+                        f"vs {baseline_errors} in input (delta=+{regression_delta}). "
+                        f"Remediation made the document LESS compliant."
+                    )
+                    logger.error(regression_msg)
+                    root_span.set_attribute("verapdf.regression", True)
+                    root_span.set_attribute("verapdf.regression_delta", regression_delta)
+                    # Record regression in remediation events for the audit trail
+                    if collector:
+                        from services.common.remediation_events import RemediationComponent
+                        collector.record(
+                            RemediationComponent.MARK_INFO,
+                            before=f"baseline_errors={baseline_errors}",
+                            after=f"endline_errors={endline_errors}",
+                            source="verapdf_regression_gate",
+                        )
+                    # Optionally block output when regression gate is set to blocking
+                    if settings.regression_gate_blocking:
+                        raise ValidationBlockedError(regression_msg)
+                else:
+                    improvement = baseline_errors - endline_errors
+                    logger.info(
+                        "VeraPDF regression gate: PASS — output has %d fewer errors than input "
+                        "(%d → %d)",
+                        improvement, baseline_errors, endline_errors,
+                    )
+                    root_span.set_attribute("verapdf.regression", False)
+                    root_span.set_attribute("verapdf.improvement", improvement)
+
+            root_span.set_attribute("output.size_bytes", len(output_bytes))
+            root_span.set_attribute("validation.score", score)
+            logger.info(
+                "Conversion complete: document_id=%s format=%s size=%d bytes score=%.2f",
+                ir_doc.document_id, output_format, len(output_bytes), score,
             )
 
-        # Stage 4c: VeraPDF endline placeholder (populated after stage_output for PDF)
-        endline_verapdf: VeraPDFResult | None = None
+            # Persist remediation events to the in-memory cache for audit trail retrieval
+            _cache_remediation_events(task_id, collector.to_dict_list())
+            root_span.set_attribute("remediation.event_count", len(collector.events()))
+            root_span.set_attribute("remediation.task_id", task_id)
 
-        # Stage 4d: Inject validation summary into HTML
-        html_content = _inject_validation_summary(
-            html_content, validation,
-            baseline_verapdf=baseline_verapdf,
-            endline_verapdf=endline_verapdf,
-        )
+            # Mark telemetry as successful and persist
+            tc.mark_success()
+            tc.persist(get_db(settings.db_path))
 
-        # Stage 5: Output
-        output_bytes, content_type = stage_output(
-            html_content, output_format, builder,
-            pdf_bytes=pdf_bytes, ir_doc=ir_doc, collector=collector,
-        )
+            return output_bytes, content_type, task_id
 
-        # VeraPDF endline (after remediation, PDF only)
-        if output_format == "pdf":
-            endline_verapdf = _run_verapdf_endline(output_bytes, baseline_verapdf)
-
-        root_span.set_attribute("output.size_bytes", len(output_bytes))
-        root_span.set_attribute("validation.score", score)
-        logger.info(
-            "Conversion complete: document_id=%s format=%s size=%d bytes score=%.2f",
-            ir_doc.document_id, output_format, len(output_bytes), score,
-        )
-
-        # Persist remediation events to the in-memory cache for audit trail retrieval
-        _cache_remediation_events(task_id, collector.to_dict_list())
-        root_span.set_attribute("remediation.event_count", len(collector.events()))
-        root_span.set_attribute("remediation.task_id", task_id)
-
-        return output_bytes, content_type
+        except ValidationBlockedError:
+            # Validation blocks are expected control flow — record but re-raise
+            tc.mark_failed("Validation blocked output", _current_stage)
+            tc.persist(get_db(settings.db_path))
+            raise
+        except Exception as exc:
+            tc.mark_failed(str(exc), _current_stage)
+            tc.persist(get_db(settings.db_path))
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -1054,15 +1397,29 @@ def _run_extraction(local_pdf: Path) -> dict[str, Any]:
             logger.info("Adobe Extract succeeded: %d elements (%d table)", len(elements), table_count)
             return result
 
-    except Exception as exc:
-        logger.warning("Adobe Extract unavailable (%s: %s). Falling back to pypdf.", type(exc).__name__, exc)
-
+    except ImportError as exc:
+        # SDK not installed — only acceptable in test environments.
+        # Fall back to pypdf for basic extraction.
+        logger.warning("Adobe SDK not installed (%s). Falling back to pypdf.", exc)
         with tracer.start_as_current_span("extraction.pypdf_fallback") as span:
             span.set_attribute("extraction.method", "pypdf_fallback")
-            span.set_attribute("extraction.fallback_reason", f"{type(exc).__name__}: {exc}")
+            span.set_attribute("extraction.fallback_reason", f"ImportError: {exc}")
             result = _fallback_extraction(local_pdf)
             span.set_attribute("extraction.elements_count", len(result.get("elements", [])))
             return result
+
+    except Exception as exc:
+        # Adobe API failed (credentials, network, permissions, etc.)
+        # Do NOT silently fall back — the output would be garbage.
+        logger.error(
+            "Adobe Extract FAILED (%s: %s). Refusing to deliver degraded output.",
+            type(exc).__name__, exc,
+        )
+        raise RuntimeError(
+            f"Adobe Extract API failed: {type(exc).__name__}: {exc}. "
+            f"Cannot produce quality output without structural extraction. "
+            f"Check Adobe credentials and API connectivity."
+        ) from exc
 
 
 def _fallback_extraction(local_pdf: Path) -> dict[str, Any]:
@@ -1515,28 +1872,46 @@ def _enforce_heading_hierarchy(elements: list[dict[str, Any]]) -> None:
 
 
 _RE_TABLE_CAPTION_TEXT = re.compile(
-    r"^TABLE\s+\d+[A-Za-z]?\s*[:.\-–—]\s*(.+)", re.IGNORECASE
+    r"^(?:TABLE|FIGURE|CHART|EXHIBIT)\s+\d+[A-Za-z]?\s*[:.\-–—]?\s*(.*)", re.IGNORECASE
 )
 
 
-def _attach_table_captions(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Post-pass: find 'TABLE N: description' paragraphs/headings before tables.
+def _is_likely_table_caption(text: str) -> bool:
+    """Return True if *text* is likely a table caption label.
 
-    When found, remove the paragraph and set it as the table's caption (content field).
-    This enables <caption> rendering in the HTML output.
+    Matches:
+      - "Table 1: ..." / "TABLE 1 — ..." / "Table 1" (no separator)
+      - "Figure 2: ..." (chart data tables often labeled as figures)
+      - "Chart 3 - ..." / "Exhibit A: ..."
+      - Short preceding text (<120 chars) that starts with "Table" (case-insensitive)
+    """
+    if not text:
+        return False
+    if _RE_TABLE_CAPTION_TEXT.match(text):
+        return True
+    # Short text starting with "Table" (covers "Table showing ...", etc.)
+    if len(text) < 120 and text.lower().startswith("table"):
+        return True
+    return False
+
+
+def _attach_table_captions(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Post-pass: find table caption labels in paragraphs/headings before tables.
+
+    When found, remove the paragraph and set it as the table's ``content`` field,
+    which ``_render_table()`` emits as ``<caption>`` (WCAG 1.3.1).
     """
     if len(elements) < 2:
         return elements
 
-    # Identify indices where a "TABLE N:" element precedes a table element
+    # Identify indices where a caption-like element precedes a table element
     caption_indices: set[int] = set()
     for i in range(len(elements) - 1):
         elem = elements[i]
         if elem["type"] not in ("paragraph", "heading"):
             continue
         text = elem.get("content", "").strip()
-        cap_match = _RE_TABLE_CAPTION_TEXT.match(text)
-        if not cap_match:
+        if not _is_likely_table_caption(text):
             continue
         # Look ahead for the next table (may have intervening headings from pre-header rows)
         for j in range(i + 1, min(i + 4, len(elements))):
@@ -1639,7 +2014,7 @@ def _extract_images_from_pdf(pdf_path: Path) -> list[dict[str, Any]]:
         base64 (str), mime (str)
 
     Skips images smaller than 20x20 px (decorative dots/lines).
-    Caps at 100 images per document to prevent bloat.
+    Caps at 300 images per document to prevent bloat.
     Resizes images wider than 800px and re-encodes so individual images stay
     under ~500 KB after base64 encoding (~375 KB raw threshold).
 
@@ -1664,13 +2039,13 @@ def _extract_images_from_pdf(pdf_path: Path) -> list[dict[str, Any]]:
 
     try:
         for page_num in range(len(doc)):
-            if len(results) >= 100:
+            if len(results) >= 300:
                 break
             page = doc[page_num]
             image_list = page.get_images(full=True)
 
             for img_info in image_list:
-                if len(results) >= 100:
+                if len(results) >= 300:
                     break
 
                 xref = img_info[0]
@@ -1748,6 +2123,65 @@ def _extract_images_from_pdf(pdf_path: Path) -> list[dict[str, Any]]:
     return results
 
 
+def _clip_figure_from_pdf(
+    pdf_path: Path | None,
+    page_num: int,
+    bounds: list[float] | None,
+) -> str | None:
+    """Clip a figure region from the original PDF page using PyMuPDF.
+
+    When Adobe Extract returns a Figure element with bounding box coordinates
+    but no image bytes (and PyMuPDF bbox matching also fails), this function
+    renders the figure's bounding box region from the original PDF page at
+    150 DPI and returns it as a data-URI PNG.
+
+    Returns a ``data:image/png;base64,...`` string on success, None on failure.
+    """
+    if pdf_path is None or not bounds or len(bounds) != 4:
+        return None
+
+    try:
+        import fitz  # noqa: PLC0415
+    except ImportError:
+        return None
+
+    try:
+        doc = fitz.open(str(pdf_path))
+        if page_num < 0 or page_num >= len(doc):
+            doc.close()
+            return None
+
+        page = doc[page_num]
+        x0, y0, x1, y1 = bounds
+
+        # Validate bounds are reasonable
+        if x1 <= x0 or y1 <= y0:
+            doc.close()
+            return None
+
+        clip_rect = fitz.Rect(x0, y0, x1, y1)
+
+        # Render at 150 DPI (2x default 72 DPI) for decent quality
+        mat = fitz.Matrix(150 / 72, 150 / 72)
+        pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+
+        if len(png_bytes) < 100:  # Too small to be a real image
+            return None
+
+        b64 = base64.b64encode(png_bytes).decode()
+        logger.debug(
+            "_clip_figure_from_pdf: clipped page %d bbox %s → %d bytes PNG",
+            page_num, bounds, len(png_bytes),
+        )
+        return f"data:image/png;base64,{b64}"
+
+    except Exception as exc:
+        logger.debug("_clip_figure_from_pdf failed: %s", exc)
+        return None
+
+
 def _match_figure_to_image(
     figure_elem: dict[str, Any],
     extracted_images: list[dict[str, Any]],
@@ -1801,6 +2235,266 @@ def _match_figure_to_image(
             best_img = img
 
     return best_img if best_img is not None else same_page[0]
+
+
+# ---------------------------------------------------------------------------
+# Header / Footer / Artifact Filtering
+# ---------------------------------------------------------------------------
+
+# Exact known footer lines (normalized uppercase, whitespace-collapsed).
+# Using exact match avoids deleting legitimate body text like "Prepared by DKS Associates".
+_ROGUE_FOOTER_EXACT: set[str] = {
+    "DKS SACRAMENTO COUNTY LOCAL ROAD SAFETY PLAN",
+    "SACRAMENTO COUNTY DEPARTMENT OF TRANSPORTATION",
+    "SACDOT",
+}
+
+
+def _norm_text(s: str) -> str:
+    """Normalize text for artifact comparison: uppercase, collapse whitespace."""
+    return re.sub(r"\s+", " ", (s or "").strip().upper())
+
+
+def _is_artifact(element: dict[str, Any]) -> bool:
+    """Return True if the Adobe Extract element is a header/footer/pagination artifact.
+
+    Adobe Extract marks running headers, footers, and page numbers with specific
+    Path components (``/Artifact``, ``/Header``, ``/Footer``) and metadata fields.
+    These elements corrupt the reading order if included in the body flow
+    (WCAG 1.3.1, 1.3.2).
+
+    Uses exact-match footer set (not substring) to avoid deleting legitimate
+    body content like "Prepared by DKS Associates".
+    """
+    path = element.get("Path") or ""
+    text_type = element.get("TextType") or ""
+    role = element.get("Role") or ""
+    text = (element.get("Text") or "").strip()
+
+    # Primary: Adobe path-based artifact tags
+    if any(tag in path for tag in ("/Artifact", "/Header", "/Footer", "/Pagination")):
+        return True
+
+    # Secondary: metadata fields
+    lower_text_type = text_type.lower()
+    lower_role = role.lower()
+    if lower_text_type in {"pagination", "artifact", "header", "footer"}:
+        return True
+    if lower_role in {"artifact", "pagination", "header", "footer"}:
+        return True
+
+    # Exact known footer lines (safe — won't match partial body text)
+    norm = _norm_text(text)
+    if norm in _ROGUE_FOOTER_EXACT:
+        return True
+
+    # Isolated page numbers (1-3 digit standalone numbers)
+    if text and text.isdigit() and len(text) <= 3:
+        return True
+
+    return False
+
+
+def drop_running_artifacts(ir_doc: IRDocument) -> IRDocument:
+    """Remove repeated short text blocks that appear at consistent vertical positions.
+
+    This catches running headers/footers that Adobe did NOT tag as artifacts.
+    A text block is considered a "running artifact" if the same normalized text
+    appears at the same vertical band (5% of page height) on 8+ pages.
+
+    Only TEXT and HEADING blocks shorter than 40 characters are considered.
+    This preserves legitimate repeated content in body paragraphs.
+    """
+    from collections import defaultdict
+
+    counts: dict[tuple[str, float], int] = defaultdict(int)
+    refs: list[tuple[int, int, tuple[str, float]]] = []
+
+    for p_idx, page in enumerate(ir_doc.pages):
+        page_h = page.height or 792.0
+        for b_idx, block in enumerate(page.blocks):
+            if block.block_type not in (BlockType.PARAGRAPH, BlockType.HEADING):
+                continue
+            txt = _norm_text(block.content)
+            if not txt or len(txt) > 40:
+                continue
+            # Use y1 (top of bbox) for vertical position bucketing
+            y1 = block.bbox.y1
+            if y1 == 0.0 and block.bbox.y2 == 0.0:
+                continue  # No bbox data available
+            y_bucket = round((y1 / page_h) / 0.05) * 0.05  # 5% vertical bands
+            key = (txt, y_bucket)
+            counts[key] += 1
+            refs.append((p_idx, b_idx, key))
+
+    # Blocks that appear on 8+ pages at the same position are running artifacts
+    repeated = {k for k, c in counts.items() if c >= 8}
+    if not repeated:
+        return ir_doc
+
+    removed = 0
+    mark: set[tuple[int, int]] = set()
+    for p_idx, b_idx, key in refs:
+        if key in repeated:
+            mark.add((p_idx, b_idx))
+            removed += 1
+
+    for p_idx, page in enumerate(ir_doc.pages):
+        page.blocks = [
+            b for b_idx, b in enumerate(page.blocks)
+            if (p_idx, b_idx) not in mark
+        ]
+
+    if removed:
+        logger.info(
+            "drop_running_artifacts: removed %d running artifact blocks (%d patterns)",
+            removed, len(repeated),
+        )
+
+    return ir_doc
+
+
+# ---------------------------------------------------------------------------
+# Visual fidelity: style extraction from Adobe JSON
+# ---------------------------------------------------------------------------
+
+_ALIGN_MAP = {"Start": "left", "End": "right", "Center": "center", "Justify": "justify"}
+
+
+def _extract_element_style(elem: dict[str, Any]) -> dict[str, Any]:
+    """Extract visual style info from an Adobe Extract JSON element.
+
+    Returns a dict with CSS-ready properties (empty dict when nothing useful):
+    - font_family: str (e.g. "Arial")
+    - font_size: float (in points)
+    - font_bold: bool
+    - font_italic: bool
+    - text_align: str ("left", "center", "right", "justify")
+    """
+    from services.common.config import settings
+    if not settings.preserve_source_styles:
+        return {}
+
+    style: dict[str, Any] = {}
+
+    font = elem.get("Font")
+    if isinstance(font, dict):
+        family = (
+            font.get("alt_family_name")
+            or font.get("family_name")
+            or font.get("name")
+        )
+        if family:
+            style["font_family"] = family
+        if font.get("weight", 400) >= 600:
+            style["font_bold"] = True
+        if font.get("italic"):
+            style["font_italic"] = True
+
+    raw_size = elem.get("TextSize")
+    if raw_size is not None:
+        try:
+            style["font_size"] = round(float(raw_size), 1)
+        except (TypeError, ValueError):
+            pass
+
+    attrs = elem.get("attributes") or {}
+    align = attrs.get("InlineAlign") or attrs.get("TextAlign")
+    if align:
+        css_align = _ALIGN_MAP.get(align, align.lower())
+        if css_align in ("left", "right", "center", "justify"):
+            style["text_align"] = css_align
+
+    return style
+
+
+def _rgb_float_to_hex(rgb: list[float]) -> str | None:
+    """Convert [0.435, 0.184, 0.623] to '#6f2f9f'. Returns None on bad input."""
+    if not isinstance(rgb, list) or len(rgb) != 3:
+        return None
+    try:
+        r, g, b = (max(0, min(255, int(x * 255))) for x in rgb)
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Form field extraction via pikepdf
+# ---------------------------------------------------------------------------
+
+
+def _extract_form_fields(pdf_path: Path) -> list[dict[str, Any]]:
+    """Enumerate AcroForm fields from a PDF using pikepdf.
+
+    Returns a list of element dicts compatible with _reconstruct_document output,
+    one per form field found.
+    """
+    try:
+        import pikepdf
+    except ImportError:
+        logger.warning("pikepdf not available — skipping form field extraction")
+        return []
+
+    fields: list[dict[str, Any]] = []
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            acroform = pdf.Root.get("/AcroForm")
+            if not acroform:
+                return []
+
+            raw_fields = acroform.get("/Fields", [])
+            for field_ref in raw_fields:
+                try:
+                    field_obj = pdf.get_object(field_ref) if hasattr(field_ref, 'objgen') else field_ref
+                    field_type_raw = str(field_obj.get("/FT", ""))
+                    field_name = str(field_obj.get("/T", ""))
+                    tooltip = str(field_obj.get("/TU", ""))
+                    rect = field_obj.get("/Rect")
+
+                    # Map PDF field type to human-readable name
+                    type_map = {"/Tx": "text", "/Btn": "checkbox", "/Ch": "dropdown", "/Sig": "signature"}
+                    field_type = type_map.get(field_type_raw, "text")
+
+                    # Check for radio buttons (Btn with /Ff flag bit 16 set)
+                    if field_type == "checkbox":
+                        ff = int(field_obj.get("/Ff", 0))
+                        if ff & (1 << 15):
+                            field_type = "radio"
+
+                    # Determine page number from widget annotation
+                    page_num = 0
+                    if rect:
+                        # Try to determine page from /P reference
+                        page_ref = field_obj.get("/P")
+                        if page_ref:
+                            for idx, pg in enumerate(pdf.pages):
+                                if pg.objgen == page_ref.objgen:
+                                    page_num = idx
+                                    break
+
+                    fields.append({
+                        "type": "form_field",
+                        "content": tooltip or field_name,
+                        "attributes": {
+                            "field_type": field_type,
+                            "field_name": field_name,
+                            "tooltip": tooltip,
+                            "required": bool(int(field_obj.get("/Ff", 0)) & 2),
+                            "page": page_num,
+                        },
+                    })
+                except Exception as exc:
+                    logger.debug("Skipping malformed form field: %s", exc)
+                    continue
+
+    except Exception as exc:
+        logger.warning("Form field extraction failed: %s", exc)
+        return []
+
+    if fields:
+        logger.info("Extracted %d form fields from PDF", len(fields))
+    return fields
 
 
 def _reconstruct_document(
@@ -1896,6 +2590,7 @@ def _reconstruct_document(
         pending_list_page = 0
 
     skip_indices: set[int] = set()
+    filtered_artifact_count = 0
 
     for i, elem in enumerate(raw_elements):
         if i in skip_indices:
@@ -1904,6 +2599,11 @@ def _reconstruct_document(
             _flush_list()
             result.extend(table_insert_at[i])
         if i in table_consumed:
+            continue
+
+        # --- Skip header/footer/pagination artifacts (WCAG 1.3.1, 1.3.2) ---
+        if _is_artifact(elem):
+            filtered_artifact_count += 1
             continue
 
         path = elem.get("Path", "")
@@ -1916,7 +2616,11 @@ def _reconstruct_document(
         # --- Footnotes → render as small paragraphs ---
         if _RE_FOOTNOTE.search(path) and text:
             _flush_list()
-            result.append({"type": "paragraph", "content": text, "attributes": {"role": "note", "page": elem.get("Page", 0)}})
+            fn_attrs: dict[str, Any] = {"role": "note", "page": elem.get("Page", 0)}
+            fn_style = _extract_element_style(elem)
+            if fn_style:
+                fn_attrs["style"] = fn_style
+            result.append({"type": "paragraph", "content": text, "attributes": fn_attrs})
             continue
 
         # --- Headings ---
@@ -1946,7 +2650,11 @@ def _reconstruct_document(
             # solely by font size (via _infer_heading_levels) and post-processed
             # by _enforce_heading_hierarchy() to guarantee a valid tree.
 
-            result.append({"type": "heading", "content": text, "attributes": {"level": inferred_level, "page": elem.get("Page", 0)}})
+            h_attrs: dict[str, Any] = {"level": inferred_level, "page": elem.get("Page", 0)}
+            h_style = _extract_element_style(elem)
+            if h_style:
+                h_attrs["style"] = h_style
+            result.append({"type": "heading", "content": text, "attributes": h_attrs})
             continue
 
         # --- Figures / Images ---
@@ -1990,6 +2698,38 @@ def _reconstruct_document(
                     data_uri = f"data:{matched['mime']};base64,{matched['base64']}"
                     img_attrs["src"] = data_uri
                     extracted_images.remove(matched)  # prevent duplicate assignment
+                elif pdf_path is not None:
+                    # Strategy 2b: clip the figure region from the original PDF
+                    clipped = _clip_figure_from_pdf(
+                        pdf_path, elem.get("Page", 0), elem.get("Bounds"),
+                    )
+                    if clipped:
+                        img_attrs["src"] = clipped
+                        logger.info(
+                            "Figure on page %s: recovered via bbox clip (alt=%s)",
+                            elem.get("Page", "?"), alt[:60],
+                        )
+
+                if "src" not in img_attrs:
+                    # Strategy 3: transparent placeholder — keeps the element
+                    # in the document with descriptive alt text (still accessible)
+                    # rather than omitting it entirely or leaving src empty.
+                    _placeholder_svg = (
+                        '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">'
+                        '<rect width="100%" height="100%" fill="#f3f4f6"/>'
+                        '<text x="50%" y="50%" text-anchor="middle" fill="#6b7280" '
+                        'font-family="sans-serif" font-size="14">'
+                        '[Figure - see alt text]</text></svg>'
+                    )
+                    img_attrs["src"] = (
+                        "data:image/svg+xml;base64,"
+                        + base64.b64encode(_placeholder_svg.encode("utf-8")).decode()
+                    )
+                    img_attrs["data-placeholder"] = "true"
+                    logger.info(
+                        "Figure on page %s: no image data found, using placeholder (alt=%s)",
+                        elem.get("Page", "?"), alt[:60],
+                    )
 
             result.append({"type": "image", "content": "", "attributes": img_attrs})
 
@@ -2040,7 +2780,11 @@ def _reconstruct_document(
 
         # --- Regular paragraph ---
         _flush_list()
-        result.append({"type": "paragraph", "content": text, "attributes": {"page": elem.get("Page", 0)}})
+        p_attrs: dict[str, Any] = {"page": elem.get("Page", 0)}
+        p_style = _extract_element_style(elem)
+        if p_style:
+            p_attrs["style"] = p_style
+        result.append({"type": "paragraph", "content": text, "attributes": p_attrs})
 
     # Flush any remaining list items
     _flush_list()
@@ -2051,7 +2795,10 @@ def _reconstruct_document(
     # Post-pass: detect "TABLE N:" paragraphs and convert to table captions
     result = _attach_table_captions(result)
 
-    logger.info("Reconstructed: %d raw -> %d output (%d table regions)", len(raw_elements), len(result), len(table_ranges))
+    logger.info(
+        "Reconstructed: %d raw -> %d output (%d table regions, %d artifacts filtered)",
+        len(raw_elements), len(result), len(table_ranges), filtered_artifact_count,
+    )
     return result
 
 

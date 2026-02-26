@@ -127,13 +127,13 @@ class DocumentStatusResponse(BaseModel):
 
 class ReviewDecision(BaseModel):
     decision: str = Field(description="approve, edit, or reject")
-    edit_content: Optional[str] = None
-    reviewer_id: str
+    reviewer_edit: Optional[str] = None
+    reviewed_by: str
 
 
 class BatchApproveRequest(BaseModel):
     item_ids: list[str]
-    reviewer_id: str
+    reviewed_by: str
 
 
 class PipelineHealthResponse(BaseModel):

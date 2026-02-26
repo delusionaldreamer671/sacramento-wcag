@@ -39,6 +39,28 @@ class APIError extends Error {
   }
 }
 
+/**
+ * Safely extract a human-readable error message from a fetch Response.
+ * Handles: plain text, JSON { detail: string }, JSON { detail: { message: string } },
+ * and falls back to statusText to prevent [object Object] display.
+ */
+async function extractErrorMessage(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    try {
+      const json = JSON.parse(text);
+      if (typeof json.detail === "string") return json.detail;
+      if (json.detail?.message) return json.detail.message;
+      if (typeof json.message === "string") return json.message;
+      return JSON.stringify(json.detail ?? json);
+    } catch {
+      return text || response.statusText;
+    }
+  } catch {
+    return response.statusText;
+  }
+}
+
 async function request<T>(
   path: string,
   options: RequestInit = {},
@@ -56,17 +78,7 @@ async function request<T>(
   });
 
   if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: string | { message?: string } };
-      if (body.detail) {
-        detail = typeof body.detail === "string"
-          ? body.detail
-          : body.detail.message ?? JSON.stringify(body.detail);
-      }
-    } catch {
-      // ignore parse error — use statusText fallback
-    }
+    const detail = await extractErrorMessage(response);
     throw new APIError(
       response.status,
       response.statusText,
@@ -156,7 +168,7 @@ export async function batchApprove(request_: BatchApproveRequest): Promise<void>
  * Fetch pipeline health status.
  */
 export async function fetchHealth(): Promise<PipelineHealthResponse> {
-  return request<PipelineHealthResponse>("/health");
+  return request<PipelineHealthResponse>("/api/health");
 }
 
 /**
@@ -189,17 +201,7 @@ export async function uploadAndConvert(
   });
 
   if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: string | { message?: string } };
-      if (body.detail) {
-        detail = typeof body.detail === "string"
-          ? body.detail
-          : body.detail.message ?? JSON.stringify(body.detail);
-      }
-    } catch {
-      // ignore parse error — use statusText fallback
-    }
+    const detail = await extractErrorMessage(response);
     throw new APIError(
       response.status,
       response.statusText,
@@ -242,13 +244,24 @@ export interface AnalysisProposal {
   id: string;
   category: string;
   wcag_criterion: string;
+  rule_name: string;
   element_type: string;
   element_id: string;
+  image_id?: string;
   description: string;
   proposed_fix: string;
   severity: string;
   page: number;
   auto_fixable: boolean;
+  action_type: "auto_fix" | "ai_draft" | "manual_review";
+}
+
+export interface RuleBreakdownEntry {
+  criterion: string;
+  name: string;
+  status: "pass" | "fail" | "not_applicable" | "error";
+  finding_count: number;
+  severity_max: string | null;
 }
 
 export interface AnalysisSummary {
@@ -256,8 +269,30 @@ export interface AnalysisSummary {
   critical: number;
   serious: number;
   moderate: number;
+  warning: number;
   auto_fixable: number;
   needs_review: number;
+  rules_checked: number;
+  rules_passed: number;
+  rules_failed: number;
+  rules_not_applicable: number;
+  rules_errored: number;
+  coverage_pct: number;
+  rules_breakdown: RuleBreakdownEntry[];
+}
+
+export interface AltTextProposal {
+  id: string;
+  image_id: string;
+  block_id: string;
+  page_num: number;
+  original_alt: string;
+  proposed_alt: string;
+  image_classification: string;
+  confidence: number;
+  status: string;
+  reviewer_decision: string | null;
+  reviewer_edit: string | null;
 }
 
 export interface AnalysisResult {
@@ -266,6 +301,7 @@ export interface AnalysisResult {
   page_count: number;
   proposals: AnalysisProposal[];
   summary: AnalysisSummary;
+  alt_text_proposals: AltTextProposal[];
 }
 
 /**
@@ -286,17 +322,7 @@ export async function analyzeDocument(file: File): Promise<AnalysisResult> {
   });
 
   if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: string | { message?: string } };
-      if (body.detail) {
-        detail = typeof body.detail === "string"
-          ? body.detail
-          : body.detail.message ?? JSON.stringify(body.detail);
-      }
-    } catch {
-      // ignore parse error — use statusText fallback
-    }
+    const detail = await extractErrorMessage(response);
     throw new APIError(
       response.status,
       response.statusText,
@@ -314,13 +340,17 @@ export async function analyzeDocument(file: File): Promise<AnalysisResult> {
 export async function remediateDocument(
   file: File,
   outputFormat: "html" | "pdf" = "html",
+  approvedIds?: string[],
 ): Promise<ConvertResult> {
   if (!file) throw new Error("remediateDocument: file is required");
 
   const formData = new FormData();
   formData.append("file", file);
+  if (approvedIds && approvedIds.length > 0) {
+    formData.append("approved_ids", JSON.stringify(approvedIds));
+  }
 
-  const url = `${BASE_URL}/api/remediate?output_format=${encodeURIComponent(outputFormat)}`;
+  const url = `${BASE_URL}/api/remediate?output_format=${encodeURIComponent(outputFormat)}&validation_mode=draft`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -328,17 +358,7 @@ export async function remediateDocument(
   });
 
   if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: string | { message?: string } };
-      if (body.detail) {
-        detail = typeof body.detail === "string"
-          ? body.detail
-          : body.detail.message ?? JSON.stringify(body.detail);
-      }
-    } catch {
-      // ignore parse error — use statusText fallback
-    }
+    const detail = await extractErrorMessage(response);
     throw new APIError(
       response.status,
       response.statusText,
@@ -429,5 +449,137 @@ export async function fetchAuditTrail(
 ): Promise<AuditEntry[]> {
   return request<AuditEntry[]>(
     `/api/audit/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}`,
+  );
+}
+
+// --- WCAG Rules Reference API ---
+
+export interface TechniqueRef {
+  id: string;
+  title: string;
+  technique_type: string;
+  pdf_structure: string;
+  check_description: string;
+}
+
+export interface FailureTechniqueRef {
+  id: string;
+  title: string;
+  description: string;
+  pdf_implication: string;
+}
+
+export interface WCAGRuleRef {
+  criterion: string;
+  name: string;
+  level: string;
+  principle: string;
+  guideline: string;
+  description: string;
+  pdf_applicability: string;
+  automation: string;
+  default_severity: string;
+  default_remediation: string;
+  condition: string;
+  pdf_techniques: TechniqueRef[];
+  failure_techniques: FailureTechniqueRef[];
+}
+
+export async function fetchWCAGRules(): Promise<WCAGRuleRef[]> {
+  return request<WCAGRuleRef[]>("/api/wcag-rules");
+}
+
+// --- Coverage Matrix API ---
+
+export interface CoverageMatrixEntry {
+  criterion: string;
+  name: string;
+  level: string;
+  principle: string;
+  guideline: string;
+  description: string;
+  pdf_applicability: string;
+  automation: string;
+  default_severity: string;
+  default_remediation: string;
+  condition: string;
+  pdf_techniques: TechniqueRef[];
+  failure_techniques: FailureTechniqueRef[];
+}
+
+export interface CoverageSummary {
+  total_criteria: number;
+  by_level: Record<string, number>;
+  by_automation: Record<string, number>;
+  by_applicability: Record<string, number>;
+  by_remediation: Record<string, number>;
+}
+
+export interface ContentTypeEntry {
+  content_type: string;
+  description: string;
+  relevant_criteria: string[];
+  automated_count: number;
+  ai_assisted_count: number;
+  human_review_count: number;
+  automated_actions: string[];
+  ai_assisted_actions: string[];
+  human_review_actions: string[];
+}
+
+export async function fetchCoverageMatrix(): Promise<CoverageMatrixEntry[]> {
+  return request<CoverageMatrixEntry[]>("/api/wcag/coverage-matrix");
+}
+
+export async function fetchCoverageSummary(): Promise<CoverageSummary> {
+  return request<CoverageSummary>("/api/wcag/coverage-summary");
+}
+
+export async function fetchContentTypeMatrix(): Promise<ContentTypeEntry[]> {
+  return request<ContentTypeEntry[]>("/api/wcag/content-type-matrix");
+}
+
+// --- Alt Text Proposals API ---
+
+export async function fetchAltTextProposals(
+  taskId: string,
+): Promise<{ task_id: string; proposals: AltTextProposal[]; count: number }> {
+  return request<{ task_id: string; proposals: AltTextProposal[]; count: number }>(
+    `/api/documents/${encodeURIComponent(taskId)}/alt-text-proposals`,
+  );
+}
+
+export async function submitAltTextDecision(
+  proposalId: string,
+  decision: string,
+  reviewerEdit?: string,
+  reviewedBy?: string,
+): Promise<AltTextProposal> {
+  return request<AltTextProposal>(
+    `/api/alt-text-proposals/${encodeURIComponent(proposalId)}/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        decision,
+        reviewer_edit: reviewerEdit ?? null,
+        reviewed_by: reviewedBy ?? null,
+      }),
+    },
+  );
+}
+
+export async function batchApproveAltText(
+  proposalIds: string[],
+  reviewedBy?: string,
+): Promise<{ approved_count: number }> {
+  return request<{ approved_count: number }>(
+    "/api/alt-text-proposals/batch-approve",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        proposal_ids: proposalIds,
+        reviewed_by: reviewedBy ?? null,
+      }),
+    },
   );
 }

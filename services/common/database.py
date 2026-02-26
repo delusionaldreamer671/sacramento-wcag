@@ -74,6 +74,99 @@ CREATE TABLE IF NOT EXISTS remediation_events (
     source TEXT NOT NULL DEFAULT 'pipeline', timestamp TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_remed_task ON remediation_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_remed_doc ON remediation_events(document_id);
+CREATE TABLE IF NOT EXISTS pipeline_telemetry (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    -- Timing (seconds)
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    total_duration_s REAL,
+    extract_duration_s REAL,
+    ai_duration_s REAL,
+    build_html_duration_s REAL,
+    validate_duration_s REAL,
+    output_duration_s REAL,
+    -- Extraction metrics
+    blocks_extracted INTEGER DEFAULT 0,
+    images_found INTEGER DEFAULT 0,
+    tables_found INTEGER DEFAULT 0,
+    headings_found INTEGER DEFAULT 0,
+    artifacts_filtered INTEGER DEFAULT 0,
+    -- AI metrics
+    ai_model TEXT,
+    ai_alt_text_attempted INTEGER DEFAULT 0,
+    ai_alt_text_succeeded INTEGER DEFAULT 0,
+    ai_alt_text_failed INTEGER DEFAULT 0,
+    ai_table_attempted INTEGER DEFAULT 0,
+    ai_table_succeeded INTEGER DEFAULT 0,
+    -- Validation metrics
+    gate_g1_passed INTEGER,
+    gate_g3_passed INTEGER,
+    axe_score REAL,
+    axe_violations_critical INTEGER DEFAULT 0,
+    axe_violations_serious INTEGER DEFAULT 0,
+    validation_blocked INTEGER DEFAULT 0,
+    -- Output metrics
+    output_format TEXT,
+    output_size_bytes INTEGER DEFAULT 0,
+    output_method TEXT,
+    -- Status
+    status TEXT NOT NULL DEFAULT 'running',
+    error_message TEXT,
+    error_stage TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_doc ON pipeline_telemetry(document_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_status ON pipeline_telemetry(status);
+CREATE TABLE IF NOT EXISTS image_assets (
+    image_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    page_num INTEGER NOT NULL DEFAULT 0,
+    mime_type TEXT NOT NULL DEFAULT 'image/png',
+    image_data BLOB NOT NULL,
+    width INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_img_doc ON image_assets(document_id);
+CREATE TABLE IF NOT EXISTS baseline_validations (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    document_id TEXT NOT NULL DEFAULT '',
+    pdf_size_bytes INTEGER NOT NULL DEFAULT 0,
+    is_compliant INTEGER NOT NULL DEFAULT 0,
+    total_rules_checked INTEGER NOT NULL DEFAULT 0,
+    passed_rules INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    failed_clauses TEXT NOT NULL DEFAULT '[]',
+    failed_rules_json TEXT NOT NULL DEFAULT '[]',
+    raw_response TEXT,
+    created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_baseline_task ON baseline_validations(task_id);
+CREATE INDEX IF NOT EXISTS idx_baseline_doc ON baseline_validations(document_id);
+CREATE TABLE IF NOT EXISTS alt_text_proposals (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    document_id TEXT NOT NULL DEFAULT '',
+    image_id TEXT NOT NULL DEFAULT '',
+    block_id TEXT NOT NULL DEFAULT '',
+    page_num INTEGER NOT NULL DEFAULT 0,
+    original_alt TEXT NOT NULL DEFAULT '',
+    proposed_alt TEXT NOT NULL DEFAULT '',
+    image_classification TEXT NOT NULL DEFAULT 'informative',
+    confidence REAL NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewer_decision TEXT,
+    reviewer_edit TEXT,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_altp_task ON alt_text_proposals(task_id);
+CREATE INDEX IF NOT EXISTS idx_altp_doc ON alt_text_proposals(document_id);
+CREATE INDEX IF NOT EXISTS idx_altp_status ON alt_text_proposals(status);
 """
 
 # JSON fields that must be auto-decoded on read
@@ -103,29 +196,48 @@ def _decode_row(table: str, row: dict) -> dict:
 
 
 class Database:
-    """Thread-safe SQLite wrapper for the WCAG pipeline."""
+    """Database wrapper for the WCAG pipeline.
 
-    def __init__(self, db_path: str = "wcag_pipeline.db") -> None:
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.executescript(_DDL)
-        self._conn.commit()
+    Supports SQLite (default) and PostgreSQL via the backend abstraction layer.
+    When db_path is provided (including ":memory:"), uses SQLite directly.
+    When a backend object is provided, uses it instead.
+    """
+
+    def __init__(
+        self,
+        db_path: str = "wcag_pipeline.db",
+        backend: Any = None,
+    ) -> None:
+        if backend is not None:
+            self._backend = backend
+        else:
+            # Default: SQLite (backward compatible)
+            from services.common.db_backend import SQLiteBackend
+            self._backend = SQLiteBackend(db_path)
+
+        self._backend.execute_pragma("PRAGMA journal_mode=WAL;")
+        self._backend.execute_pragma("PRAGMA foreign_keys=ON;")
+
+        # Use Postgres DDL if backend is postgres, otherwise SQLite DDL
+        if self._backend.backend_type == "postgres":
+            from services.common.db_backend import _POSTGRES_DDL
+            self._backend.execute_ddl(_POSTGRES_DDL)
+        else:
+            self._backend.execute_ddl(_DDL)
 
     def _one(self, sql: str, p: tuple = (), table: str = "") -> dict | None:
-        row = self._conn.execute(sql, p).fetchone()
+        row = self._backend.fetchone(sql, p)
         if row is None:
             return None
-        return _decode_row(table, dict(row))
+        return _decode_row(table, row)
 
     def _all(self, sql: str, p: tuple = (), table: str = "") -> list[dict]:
-        rows = [dict(r) for r in self._conn.execute(sql, p).fetchall()]
+        rows = self._backend.fetchall(sql, p)
         return [_decode_row(table, r) for r in rows]
 
     def _run(self, sql: str, p: tuple = ()) -> None:
-        self._conn.execute(sql, p)
-        self._conn.commit()
+        self._backend.execute(sql, p)
+        self._backend.commit()
 
     # ------------------------------------------------------------------
     # Documents
@@ -417,6 +529,270 @@ class Database:
                         pass
         return rows
 
+    # ------------------------------------------------------------------
+    # Pipeline Telemetry
+    # ------------------------------------------------------------------
+
+    def insert_telemetry(self, record: dict) -> None:
+        """Insert a new telemetry record.
+
+        Uses the dict keys as column names with a parameterized INSERT.
+        Only keys that match actual table columns are written; unknown keys
+        are silently ignored.
+        """
+        # Allowlist of valid column names to prevent SQL injection
+        _valid_cols = {
+            "id", "document_id", "task_id", "filename", "file_size_bytes",
+            "page_count", "started_at", "completed_at", "total_duration_s",
+            "extract_duration_s", "ai_duration_s", "build_html_duration_s",
+            "validate_duration_s", "output_duration_s", "blocks_extracted",
+            "images_found", "tables_found", "headings_found",
+            "artifacts_filtered", "ai_model", "ai_alt_text_attempted",
+            "ai_alt_text_succeeded", "ai_alt_text_failed",
+            "ai_table_attempted", "ai_table_succeeded", "gate_g1_passed",
+            "gate_g3_passed", "axe_score", "axe_violations_critical",
+            "axe_violations_serious", "validation_blocked", "output_format",
+            "output_size_bytes", "output_method", "status", "error_message",
+            "error_stage",
+        }
+        filtered = {k: v for k, v in record.items() if k in _valid_cols}
+        if not filtered:
+            return
+        cols = ", ".join(filtered.keys())
+        placeholders = ", ".join("?" for _ in filtered)
+        self._run(
+            f"INSERT INTO pipeline_telemetry ({cols}) VALUES ({placeholders})",
+            tuple(filtered.values()),
+        )
+
+    def update_telemetry(self, telemetry_id: str, updates: dict) -> None:
+        """Update an existing telemetry record with new metrics."""
+        _valid_cols = {
+            "document_id", "task_id", "filename", "file_size_bytes",
+            "page_count", "started_at", "completed_at", "total_duration_s",
+            "extract_duration_s", "ai_duration_s", "build_html_duration_s",
+            "validate_duration_s", "output_duration_s", "blocks_extracted",
+            "images_found", "tables_found", "headings_found",
+            "artifacts_filtered", "ai_model", "ai_alt_text_attempted",
+            "ai_alt_text_succeeded", "ai_alt_text_failed",
+            "ai_table_attempted", "ai_table_succeeded", "gate_g1_passed",
+            "gate_g3_passed", "axe_score", "axe_violations_critical",
+            "axe_violations_serious", "validation_blocked", "output_format",
+            "output_size_bytes", "output_method", "status", "error_message",
+            "error_stage",
+        }
+        filtered = {k: v for k, v in updates.items() if k in _valid_cols}
+        if not filtered:
+            return
+        sets = ", ".join(f"{k}=?" for k in filtered)
+        params = list(filtered.values()) + [telemetry_id]
+        self._run(
+            f"UPDATE pipeline_telemetry SET {sets} WHERE id=?",
+            tuple(params),
+        )
+
+    def get_telemetry(self, telemetry_id: str) -> dict | None:
+        """Get a single telemetry record."""
+        return self._one(
+            "SELECT * FROM pipeline_telemetry WHERE id=?", (telemetry_id,)
+        )
+
+    # ------------------------------------------------------------------
+    # Image Assets (HITL preview)
+    # ------------------------------------------------------------------
+
+    def insert_image_asset(
+        self,
+        image_id: str,
+        document_id: str,
+        page_num: int,
+        mime_type: str,
+        image_data: bytes,
+        width: int = 0,
+        height: int = 0,
+    ) -> str:
+        """Persist image bytes for HITL preview. Returns image_id."""
+        try:
+            self._backend.execute(
+                "INSERT OR REPLACE INTO image_assets "
+                "(image_id, document_id, page_num, mime_type, image_data, width, height, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, document_id, page_num, mime_type, image_data, width, height, _now()),
+            )
+            self._backend.commit()
+        except Exception:
+            # Image storage must never crash the pipeline
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to store image asset %s", image_id, exc_info=True,
+            )
+        return image_id
+
+    def get_image_asset(self, image_id: str) -> dict | None:
+        """Retrieve image bytes by image_id. Returns dict with image_data BLOB."""
+        return self._backend.fetchone(
+            "SELECT * FROM image_assets WHERE image_id=?", (image_id,),
+        )
+
+    def delete_images_for_document(self, document_id: str) -> int:
+        """Delete all image assets for a document. Returns deleted count."""
+        cur = self._backend.execute(
+            "DELETE FROM image_assets WHERE document_id=?", (document_id,),
+        )
+        self._backend.commit()
+        return cur.rowcount
+
+    def list_telemetry(self, limit: int = 50, status: str | None = None) -> list[dict]:
+        """List telemetry records, newest first. Optionally filter by status."""
+        if status:
+            return self._all(
+                "SELECT * FROM pipeline_telemetry WHERE status=? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (status, limit),
+            )
+        return self._all(
+            "SELECT * FROM pipeline_telemetry ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    # ------------------------------------------------------------------
+    # Baseline Validations
+    # ------------------------------------------------------------------
+
+    def insert_baseline_validation(
+        self,
+        task_id: str,
+        document_id: str,
+        pdf_size_bytes: int,
+        is_compliant: bool,
+        total_rules_checked: int,
+        passed_rules: int,
+        error_count: int,
+        failed_clauses: list[str],
+        failed_rules: list[dict],
+        raw_response: dict | None = None,
+    ) -> str:
+        """Persist a VeraPDF baseline validation result. Returns the record id."""
+        rec_id = _new_id()
+        self._backend.execute(
+            "INSERT INTO baseline_validations "
+            "(id, task_id, document_id, pdf_size_bytes, is_compliant, "
+            "total_rules_checked, passed_rules, error_count, "
+            "failed_clauses, failed_rules_json, raw_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rec_id, task_id, document_id, pdf_size_bytes,
+                1 if is_compliant else 0,
+                total_rules_checked, passed_rules, error_count,
+                json.dumps(failed_clauses),
+                json.dumps(failed_rules),
+                json.dumps(raw_response) if raw_response else None,
+                _now(),
+            ),
+        )
+        self._backend.commit()
+        return rec_id
+
+    def get_baseline_validation(self, task_id: str) -> dict | None:
+        """Retrieve the baseline validation for a given task_id."""
+        row = self._one(
+            "SELECT * FROM baseline_validations WHERE task_id=?",
+            (task_id,),
+        )
+        if row is None:
+            return None
+        # Decode JSON fields
+        for field in ("failed_clauses", "failed_rules_json", "raw_response"):
+            if row.get(field):
+                try:
+                    row[field] = json.loads(row[field])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return row
+
+    # ------------------------------------------------------------------
+    # Alt Text Proposals
+    # ------------------------------------------------------------------
+
+    def insert_alt_text_proposal(
+        self,
+        task_id: str,
+        document_id: str,
+        image_id: str,
+        block_id: str,
+        page_num: int,
+        original_alt: str,
+        proposed_alt: str,
+        image_classification: str = "informative",
+        confidence: float = 0.0,
+    ) -> str:
+        """Insert an AI alt-text proposal. Returns the proposal id."""
+        rec_id = _new_id()
+        self._backend.execute(
+            "INSERT INTO alt_text_proposals "
+            "(id, task_id, document_id, image_id, block_id, page_num, "
+            "original_alt, proposed_alt, image_classification, confidence, "
+            "status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                rec_id, task_id, document_id, image_id, block_id, page_num,
+                original_alt, proposed_alt, image_classification, confidence,
+                _now(),
+            ),
+        )
+        self._backend.commit()
+        return rec_id
+
+    def get_alt_text_proposals(self, task_id: str) -> list[dict]:
+        """Retrieve all alt-text proposals for a task, newest first."""
+        return self._all(
+            "SELECT * FROM alt_text_proposals WHERE task_id=? ORDER BY page_num, created_at",
+            (task_id,),
+        )
+
+    def get_alt_text_proposal(self, proposal_id: str) -> dict | None:
+        """Retrieve a single alt-text proposal by id."""
+        return self._one(
+            "SELECT * FROM alt_text_proposals WHERE id=?",
+            (proposal_id,),
+        )
+
+    def update_alt_text_proposal_decision(
+        self,
+        proposal_id: str,
+        decision: str,
+        reviewer_edit: str | None = None,
+        reviewed_by: str | None = None,
+    ) -> dict | None:
+        """Record a reviewer decision on an alt-text proposal."""
+        status = "approved" if decision in ("approve", "edit") else "rejected"
+        self._backend.execute(
+            "UPDATE alt_text_proposals SET reviewer_decision=?, reviewer_edit=?, "
+            "reviewed_by=?, reviewed_at=?, status=? WHERE id=?",
+            (decision, reviewer_edit, reviewed_by, _now(), status, proposal_id),
+        )
+        self._backend.commit()
+        return self._one("SELECT * FROM alt_text_proposals WHERE id=?", (proposal_id,))
+
+    def batch_approve_alt_text_proposals(
+        self,
+        proposal_ids: list[str],
+        reviewed_by: str | None = None,
+    ) -> int:
+        """Batch-approve multiple alt-text proposals. Returns count updated."""
+        now = _now()
+        count = 0
+        for pid in proposal_ids:
+            cur = self._backend.execute(
+                "UPDATE alt_text_proposals SET reviewer_decision='approve', "
+                "status='approved', reviewed_by=?, reviewed_at=? "
+                "WHERE id=? AND status='pending'",
+                (reviewed_by, now, pid),
+            )
+            count += cur.rowcount
+        self._backend.commit()
+        return count
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton
@@ -430,8 +806,20 @@ def get_db(db_path: str = "wcag_pipeline.db") -> Database:
 
     First call creates the instance with *db_path*; subsequent calls
     return the cached instance regardless of *db_path*.
+
+    When WCAG_DB_BACKEND=postgres is set (via config), creates a
+    PostgreSQL-backed instance instead of SQLite.
     """
     global _instance
     if _instance is None:
+        try:
+            from services.common.config import settings
+            if settings.db_backend == "postgres" and settings.postgres_url:
+                from services.common.db_backend import create_backend
+                backend = create_backend("postgres", postgres_url=settings.postgres_url)
+                _instance = Database(backend=backend)
+                return _instance
+        except Exception:
+            pass  # Fall through to SQLite default
         _instance = Database(db_path)
     return _instance

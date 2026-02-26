@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo } from "react";
 import {
   Upload,
   FileText,
@@ -32,9 +32,11 @@ import {
   fetchRemediationReport,
   createProposal,
 } from "@/lib/api";
+import { publishAnalysis } from "@/lib/analysis-store";
 import type {
   AnalysisResult,
   AnalysisProposal,
+  RuleBreakdownEntry,
   RemediationReport,
   RemediationEvent,
 } from "@/lib/api";
@@ -92,15 +94,23 @@ function sourceBadge(source: string): string {
 function categoryIcon(category: string) {
   switch (category) {
     case "alt_text":
+    case "placeholder_alt_text":
+    case "missing_image_src":
       return <ImageOff className="h-4 w-4" aria-hidden="true" />;
     case "heading_hierarchy":
       return <Heading className="h-4 w-4" aria-hidden="true" />;
     case "table_structure":
+    case "table_caption":
+    case "table_headers":
       return <Table2 className="h-4 w-4" aria-hidden="true" />;
     case "language":
+    case "document_title":
       return <Languages className="h-4 w-4" aria-hidden="true" />;
     case "reading_order":
       return <ArrowDownUp className="h-4 w-4" aria-hidden="true" />;
+    case "skip_navigation":
+    case "landmark":
+      return <Shield className="h-4 w-4" aria-hidden="true" />;
     default:
       return <Wrench className="h-4 w-4" aria-hidden="true" />;
   }
@@ -109,10 +119,18 @@ function categoryIcon(category: string) {
 function categoryLabel(category: string): string {
   const labels: Record<string, string> = {
     alt_text: "Missing Alt Text",
+    placeholder_alt_text: "Placeholder Alt Text",
+    missing_image_src: "Missing Image Source",
     heading_hierarchy: "Heading Issue",
     table_structure: "Table Structure",
+    table_caption: "Missing Table Caption",
+    table_headers: "Missing Table Headers",
     language: "Language Tag",
+    document_title: "Document Title",
     reading_order: "Reading Order",
+    skip_navigation: "Skip Navigation",
+    landmark: "Page Landmark",
+    structural: "Structural Issue",
   };
   return labels[category] || category.replace(/_/g, " ");
 }
@@ -122,6 +140,7 @@ function severityColor(severity: string): string {
     case "critical": return "bg-red-100 text-red-800 border-red-200";
     case "serious": return "bg-orange-100 text-orange-800 border-orange-200";
     case "moderate": return "bg-yellow-100 text-yellow-800 border-yellow-200";
+    case "warning": return "bg-blue-100 text-blue-800 border-blue-200";
     case "minor": return "bg-blue-100 text-blue-800 border-blue-200";
     default: return "bg-gray-100 text-gray-800 border-gray-200";
   }
@@ -650,16 +669,22 @@ function ProposalsList({
                     <span className="text-[10px] text-muted-foreground">
                       WCAG {proposal.wcag_criterion}
                     </span>
-                    {proposal.auto_fixable && (
+                    {(proposal.action_type === "ai_draft") && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-purple-50 border border-purple-200 px-2 py-0.5 text-[10px] font-medium text-purple-700">
+                        <Search className="h-2.5 w-2.5" aria-hidden="true" />
+                        AI Draft
+                      </span>
+                    )}
+                    {(proposal.action_type === "auto_fix" || (!proposal.action_type && proposal.auto_fixable)) && (
                       <span className="inline-flex items-center gap-1 rounded-full bg-green-50 border border-green-200 px-2 py-0.5 text-[10px] font-medium text-green-700">
                         <Wrench className="h-2.5 w-2.5" aria-hidden="true" />
                         Auto-fix
                       </span>
                     )}
-                    {!proposal.auto_fixable && (
+                    {(proposal.action_type === "manual_review" || (!proposal.action_type && !proposal.auto_fixable)) && (
                       <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-0.5 text-[10px] font-medium text-amber-700">
                         <Eye className="h-2.5 w-2.5" aria-hidden="true" />
-                        Needs review
+                        Needs Review
                       </span>
                     )}
                   </div>
@@ -685,51 +710,294 @@ function ProposalsList({
 }
 
 // ---------------------------------------------------------------------------
+// Rule-grouped proposals
+// ---------------------------------------------------------------------------
+
+function RuleGroupedProposals({
+  proposals,
+  selectedIds,
+  onToggle,
+  onToggleAll,
+  rulesBreakdown,
+}: {
+  proposals: AnalysisProposal[];
+  selectedIds: Set<string>;
+  onToggle: (id: string) => void;
+  onToggleAll: () => void;
+  rulesBreakdown: RuleBreakdownEntry[];
+}) {
+  const [expandedRules, setExpandedRules] = useState<Set<string>>(() => {
+    // Expand failed rules by default
+    const failed = new Set<string>();
+    for (const rule of rulesBreakdown) {
+      if (rule.status === "fail") failed.add(rule.criterion);
+    }
+    return failed;
+  });
+
+  const toggleRule = (criterion: string) => {
+    setExpandedRules((prev) => {
+      const next = new Set(prev);
+      if (next.has(criterion)) next.delete(criterion);
+      else next.add(criterion);
+      return next;
+    });
+  };
+
+  // Group proposals by criterion
+  const proposalsByRule = useMemo(() => {
+    const map = new Map<string, AnalysisProposal[]>();
+    for (const p of proposals) {
+      const key = p.wcag_criterion;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(p);
+    }
+    return map;
+  }, [proposals]);
+
+  const allSelected = proposals.length > 0 && selectedIds.size === proposals.length;
+  const someSelected = selectedIds.size > 0 && selectedIds.size < proposals.length;
+
+  // Sort: failed first, then error, then passed, then N/A
+  const sortedRules = useMemo(() => {
+    const order: Record<string, number> = { fail: 0, error: 1, pass: 2, not_applicable: 3 };
+    return [...rulesBreakdown].sort((a, b) => (order[a.status] ?? 4) - (order[b.status] ?? 4));
+  }, [rulesBreakdown]);
+
+  // Status badge helper
+  const statusBadge = (status: string) => {
+    switch (status) {
+      case "fail":
+        return <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-800 uppercase">Fail</span>;
+      case "pass":
+        return <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-bold text-green-800 uppercase">Pass</span>;
+      case "not_applicable":
+        return <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-600 uppercase">N/A</span>;
+      case "error":
+        return <span className="rounded-full bg-yellow-100 px-2 py-0.5 text-[10px] font-bold text-yellow-800 uppercase">Error</span>;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-border bg-white shadow-sac" role="region" aria-label="Accessibility proposals by rule">
+      {/* Header with Select All */}
+      <div className="flex items-center gap-3 border-b border-border bg-muted/30 px-4 py-3">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={allSelected}
+            ref={(el) => { if (el) el.indeterminate = someSelected; }}
+            onChange={onToggleAll}
+            className="h-4 w-4 rounded border-border text-sac-navy focus:ring-sac-navy"
+            aria-label={allSelected ? "Deselect all proposals" : "Select all proposals"}
+          />
+          <span className="text-sm font-medium text-foreground">
+            {allSelected ? "Deselect All" : "Select All"}
+          </span>
+        </label>
+        <span className="ml-auto text-xs text-muted-foreground">
+          {selectedIds.size} of {proposals.length} selected
+        </span>
+      </div>
+
+      {/* Rules */}
+      <div className="divide-y divide-border">
+        {sortedRules.map((rule) => {
+          const isExpanded = expandedRules.has(rule.criterion);
+          const ruleProposals = proposalsByRule.get(rule.criterion) || [];
+          const hasProposals = ruleProposals.length > 0;
+
+          return (
+            <div key={rule.criterion}>
+              {/* Rule header */}
+              <button
+                type="button"
+                onClick={() => toggleRule(rule.criterion)}
+                className={`flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-muted/30 ${
+                  rule.status === "fail" ? "bg-red-50/30" : ""
+                }`}
+                aria-expanded={isExpanded}
+                aria-controls={`rule-${rule.criterion}-proposals`}
+              >
+                {hasProposals ? (
+                  isExpanded ? (
+                    <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" aria-hidden="true" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" aria-hidden="true" />
+                  )
+                ) : (
+                  <span className="w-4 shrink-0" />
+                )}
+                <span className="text-xs font-mono font-semibold text-sac-navy">
+                  {rule.criterion}
+                </span>
+                <span className="text-sm text-foreground truncate">
+                  {rule.name}
+                </span>
+                <span className="ml-auto flex items-center gap-2 shrink-0">
+                  {hasProposals && (
+                    <span className="text-[10px] text-muted-foreground">
+                      {rule.finding_count} issue{rule.finding_count !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                  {statusBadge(rule.status)}
+                </span>
+              </button>
+
+              {/* Expanded proposals */}
+              {isExpanded && hasProposals && (
+                <ul
+                  id={`rule-${rule.criterion}-proposals`}
+                  className="divide-y divide-border/50 border-t border-border/50 bg-white"
+                  role="list"
+                >
+                  {ruleProposals.map((proposal) => {
+                    const isSelected = selectedIds.has(proposal.id);
+                    return (
+                      <li key={proposal.id}>
+                        <label
+                          className={`flex items-start gap-3 px-4 py-3 pl-12 cursor-pointer transition-colors ${
+                            isSelected ? "bg-sac-light/50" : "hover:bg-muted/30"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => onToggle(proposal.id)}
+                            className="mt-0.5 h-4 w-4 rounded border-border text-sac-navy focus:ring-sac-navy"
+                            aria-label={`${isSelected ? "Deselect" : "Select"}: ${proposal.description}`}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase ${severityColor(proposal.severity)}`}>
+                                {proposal.severity}
+                              </span>
+                              {proposal.action_type === "ai_draft" && (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-purple-50 border border-purple-200 px-2 py-0.5 text-[10px] font-medium text-purple-700">
+                                  <Search className="h-2.5 w-2.5" aria-hidden="true" />
+                                  AI Draft
+                                </span>
+                              )}
+                              {(proposal.action_type === "auto_fix" || (!proposal.action_type && proposal.auto_fixable)) && (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-green-50 border border-green-200 px-2 py-0.5 text-[10px] font-medium text-green-700">
+                                  <Wrench className="h-2.5 w-2.5" aria-hidden="true" />
+                                  Auto-fix
+                                </span>
+                              )}
+                              {(proposal.action_type === "manual_review" || (!proposal.action_type && !proposal.auto_fixable)) && (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                                  <Eye className="h-2.5 w-2.5" aria-hidden="true" />
+                                  Needs Review
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-1 text-sm text-foreground">{proposal.description}</p>
+                            <p className="mt-0.5 text-xs text-muted-foreground">{proposal.proposed_fix}</p>
+                            {proposal.page > 0 && (
+                              <p className="mt-0.5 text-[10px] text-muted-foreground">Page {proposal.page}</p>
+                            )}
+                          </div>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Analysis summary bar
 // ---------------------------------------------------------------------------
 
 function AnalysisSummaryBar({ summary }: { summary: AnalysisResult["summary"] }) {
   return (
     <div
-      className="flex flex-wrap items-center gap-3 rounded-lg border border-sac-navy/20 bg-sac-light px-4 py-3"
+      className="rounded-lg border border-sac-navy/20 bg-sac-light px-4 py-3"
       role="status"
       aria-label="Analysis summary"
     >
-      <div className="flex items-center gap-2">
-        <Search className="h-4 w-4 text-sac-navy" aria-hidden="true" />
-        <span className="text-sm font-semibold text-sac-navy">
-          {summary.total_issues} issue{summary.total_issues !== 1 ? "s" : ""} found
-        </span>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2">
+          <Search className="h-4 w-4 text-sac-navy" aria-hidden="true" />
+          <span className="text-sm font-semibold text-sac-navy">
+            {summary.total_issues} issue{summary.total_issues !== 1 ? "s" : ""} found
+          </span>
+        </div>
+        <span className="hidden sm:inline text-border">|</span>
+        <div className="flex flex-wrap gap-2 text-xs">
+          {summary.critical > 0 && (
+            <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-800">
+              {summary.critical} critical
+            </span>
+          )}
+          {summary.serious > 0 && (
+            <span className="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-800">
+              {summary.serious} serious
+            </span>
+          )}
+          {summary.moderate > 0 && (
+            <span className="rounded-full bg-yellow-100 px-2 py-0.5 font-medium text-yellow-800">
+              {summary.moderate} moderate
+            </span>
+          )}
+          {(summary.warning ?? 0) > 0 && (
+            <span className="rounded-full bg-blue-100 px-2 py-0.5 font-medium text-blue-800">
+              {summary.warning} warning
+            </span>
+          )}
+        </div>
+        <span className="hidden sm:inline text-border">|</span>
+        <div className="flex gap-2 text-xs">
+          <span className="rounded-full bg-green-50 px-2 py-0.5 font-medium text-green-700">
+            {summary.auto_fixable} auto-fixable
+          </span>
+          {summary.needs_review > 0 && (
+            <span className="rounded-full bg-amber-50 px-2 py-0.5 font-medium text-amber-700">
+              {summary.needs_review} need review
+            </span>
+          )}
+        </div>
       </div>
-      <span className="hidden sm:inline text-border">|</span>
-      <div className="flex flex-wrap gap-2 text-xs">
-        {summary.critical > 0 && (
-          <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-800">
-            {summary.critical} critical
+      {/* Rule coverage */}
+      {(summary.rules_checked ?? 0) > 0 && (
+        <div className="mt-2 flex items-center gap-3 pt-2 border-t border-sac-navy/10">
+          <span className="text-xs font-medium text-sac-navy">
+            {summary.rules_checked} rules checked:
           </span>
-        )}
-        {summary.serious > 0 && (
-          <span className="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-800">
-            {summary.serious} serious
-          </span>
-        )}
-        {summary.moderate > 0 && (
-          <span className="rounded-full bg-yellow-100 px-2 py-0.5 font-medium text-yellow-800">
-            {summary.moderate} moderate
-          </span>
-        )}
-      </div>
-      <span className="hidden sm:inline text-border">|</span>
-      <div className="flex gap-2 text-xs">
-        <span className="rounded-full bg-green-50 px-2 py-0.5 font-medium text-green-700">
-          {summary.auto_fixable} auto-fixable
-        </span>
-        {summary.needs_review > 0 && (
-          <span className="rounded-full bg-amber-50 px-2 py-0.5 font-medium text-amber-700">
-            {summary.needs_review} need review
-          </span>
-        )}
-      </div>
+          <div className="flex gap-2 text-xs">
+            <span className="rounded-full bg-green-100 px-2 py-0.5 font-medium text-green-800">
+              {summary.rules_passed} passed
+            </span>
+            <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-800">
+              {summary.rules_failed} failed
+            </span>
+            <span className="rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-600">
+              {summary.rules_not_applicable} N/A
+            </span>
+          </div>
+          {/* Mini progress bar */}
+          <div className="flex-1 h-2 rounded-full bg-gray-200 overflow-hidden min-w-[100px]">
+            <div className="h-full flex">
+              <div
+                className="bg-green-500"
+                style={{ width: `${(summary.rules_passed / summary.rules_checked) * 100}%` }}
+              />
+              <div
+                className="bg-red-500"
+                style={{ width: `${(summary.rules_failed / summary.rules_checked) * 100}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -808,6 +1076,7 @@ export default function UploadPage() {
     try {
       const result = await analyzeDocument(file);
       setAnalysisResult(result);
+      publishAnalysis(result);
       // Select all proposals by default
       setSelectedProposalIds(new Set(result.proposals.map((p) => p.id)));
       setState("proposals");
@@ -850,7 +1119,11 @@ export default function UploadPage() {
     setReport(null);
 
     try {
-      const { blob, taskId } = await remediateDocument(file, format);
+      const { blob, taskId } = await remediateDocument(
+        file,
+        format,
+        Array.from(selectedProposalIds),
+      );
       const url = URL.createObjectURL(blob);
       const stem = file.name.replace(/\.pdf$/i, "");
       setDownloadUrl(url);
@@ -1034,13 +1307,36 @@ export default function UploadPage() {
 
             {/* Proposals list */}
             <div className="mt-4">
-              <ProposalsList
+              <RuleGroupedProposals
                 proposals={analysisResult.proposals}
                 selectedIds={selectedProposalIds}
                 onToggle={handleToggleProposal}
                 onToggleAll={handleToggleAll}
+                rulesBreakdown={analysisResult.summary.rules_breakdown || []}
               />
             </div>
+
+            {/* Alt Text Review link (when proposals exist) */}
+            {analysisResult.alt_text_proposals && analysisResult.alt_text_proposals.length > 0 && (
+              <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-blue-800">
+                      {analysisResult.alt_text_proposals.length} image{analysisResult.alt_text_proposals.length !== 1 ? "s" : ""} found with alt text proposals
+                    </p>
+                    <p className="text-xs text-blue-600">
+                      Review AI-generated alt text before remediation
+                    </p>
+                  </div>
+                  <a
+                    href={`/alt-text/${analysisResult.task_id}`}
+                    className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 transition-colors"
+                  >
+                    Review Alt Text
+                  </a>
+                </div>
+              </div>
+            )}
 
             {/* Output format selector */}
             <fieldset className="mt-6">

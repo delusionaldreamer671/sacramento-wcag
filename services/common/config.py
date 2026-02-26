@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     adobe_client_secret: str = ""
 
     # Vertex AI
-    vertex_ai_model: str = "gemini-1.5-pro-002"
+    vertex_ai_model: str = "gemini-2.5-pro"
     vertex_ai_location: str = "us-central1"
 
     # Document AI (OCR)
@@ -52,12 +52,19 @@ class Settings(BaseSettings):
     verapdf_url: str = "http://localhost:8080"
     verapdf_enabled: bool = True
     verapdf_timeout_seconds: int = 60
+    regression_gate_blocking: bool = False
+    alt_text_hitl_enabled: bool = True
 
     # Extraction cache — disabled by default to ensure fresh Adobe API calls
     extraction_cache_enabled: bool = False
 
-    # Database (SQLite for POC)
+    # Visual fidelity — preserve source font/style from the PDF
+    preserve_source_styles: bool = True
+
+    # Database
     db_path: str = "wcag_pipeline.db"
+    db_backend: str = "sqlite"        # "sqlite" or "postgres"
+    postgres_url: str = ""            # e.g. "postgresql://user:pass@host:5432/dbname"
 
     # Auth tokens (POC — seeded via env vars)
     admin_token: str = ""

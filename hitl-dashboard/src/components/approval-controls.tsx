@@ -108,7 +108,7 @@ export function ApprovalControls({
             ? "Edit submitted successfully."
             : "Rejected — flagged for manual remediation.",
       );
-      onDecisionSubmitted(item.id, payload.decision, payload.edit_content);
+      onDecisionSubmitted(item.id, payload.decision, payload.reviewer_edit);
     } catch (err) {
       setError(
         err instanceof Error
@@ -123,7 +123,7 @@ export function ApprovalControls({
   function handleApprove() {
     if (isSubmitting || disabled) return;
     setActivePanel("none");
-    void submitDecision({ decision: "approve", reviewer_id: reviewerId });
+    void submitDecision({ decision: "approve", reviewed_by: reviewerId });
   }
 
   function handleEditSubmit(event: React.FormEvent) {
@@ -136,8 +136,8 @@ export function ApprovalControls({
     }
     void submitDecision({
       decision: "edit",
-      edit_content: trimmed,
-      reviewer_id: reviewerId,
+      reviewer_edit: trimmed,
+      reviewed_by: reviewerId,
     });
   }
 
@@ -145,8 +145,8 @@ export function ApprovalControls({
     event.preventDefault();
     void submitDecision({
       decision: "reject",
-      edit_content: rejectReason.trim() || undefined,
-      reviewer_id: reviewerId,
+      reviewer_edit: rejectReason.trim() || undefined,
+      reviewed_by: reviewerId,
     });
   }
 
